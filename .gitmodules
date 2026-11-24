@@ -1,0 +1,12 @@
+[submodule "vendor/KeffCavity"]
+	path = vendor/KeffCavity
+	url = https://github.com/LBNL-ETA/KeffCavity.git
+[submodule "vendor/LBNLCPPCommon"]
+	path = vendor/LBNLCPPCommon
+	url = https://github.com/LBNL-ETA/LBNLCPPCommon.git
+[submodule "vendor/eigen"]
+	path = vendor/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "vendor/Windows-CalcEngine"]
+	path = vendor/Windows-CalcEngine
+	url = https://github.com/LBNL-ETA/Windows-CalcEngine.git

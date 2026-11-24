@@ -1,0 +1,366 @@
+#pragma once
+
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "Domain.hxx"
+#include "EnclosureRadiation.hxx"
+
+namespace HygroThermFEM
+{
+    class MultiDomain;
+
+    //! \brief Domain class for solving temperature solution.
+    class ThermalDomain : public IDomain
+    {
+        friend class MultiDomain;
+
+    private:
+        //! Simple constructor - only accessible via MultiDomain
+        explicit ThermalDomain(Nodes & nodePool,
+                               Materials & materialPool,
+                               bool automaticUpdatePreviousTimestep = true);
+
+        //! \brief Creates and adds element into domain - only accessible via MultiDomain
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param index3 Node 3 index
+        //! @param index4 Node 4 index
+        //! @param materialName Material name assigned to the element
+        void createElement(size_t index1,
+                           size_t index2,
+                           size_t index3,
+                           size_t index4,
+                           const std::string & materialName) override;
+
+    public:
+
+        //! \brief Deletes geometry/BCs (base) and also clears the enclosure-radiation coordinators,
+        //! so a second run on the same domain (e.g. the CI pass after the U-factor pass) does not
+        //! retain stale coordinators that reference the previous run's nodes.
+        void clearModel() override;
+
+        //! \brief Creation of convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param fixedBCHCCoefficients structure to hold fixed convection coefficient boundary
+        //! conditions
+        //! @param t_CalculateMoisture Flag on whether or not to calculate moisture
+        void createBC_FixedHc(size_t index1,
+                              size_t index2,
+                              const FixedBCHCCoefficients & fixedBCHCCoefficients,
+                              bool t_CalculateMoisture = true);
+
+        //! \brief Creation of convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param fixedBCHCCoefficients structure to hold fixed convection coefficients boundary
+        //! conditions for transient simulations
+        //! @param calculateMoisture Flag on whether or not to calculate moisture
+        void createBC_FixedHc(size_t index1,
+                              size_t index2,
+                              const std::vector<FixedBCHCCoefficients> & fixedBCHCCoefficients,
+                              bool calculateMoisture = true);
+
+        //! \brief Creation of convection boundary condition with cyclic series
+        //!
+        //! Memory-bounded alternative to the timestep table: each field of the
+        //! coefficients cycles with its own declared period (per-field indexing,
+        //! no combined lcm-period table).
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coefficients Per-field cyclic series (air temperature, film
+        //! coefficient, air humidity)
+        //! @param calculateMoisture Flag on whether or not to calculate moisture
+        void createBC_PeriodicHc(size_t index1,
+                                 size_t index2,
+                                 const FixedHcPeriodicCoefficients & coefficients,
+                                 bool calculateMoisture = true);
+
+        //! \brief Creation of convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param varHCCoeff structure to hold variable convection coefficient boundary conditions
+        //! @param surfaceTilt Surface tilt at the boundary [degrees]
+        //! @param simulateVaporFluxEnergy Flag on whether or not to include energy from moisture
+        //! flux
+        void createBC_TARPHc(size_t index1,
+                             size_t index2,
+                             const TARPCoefficients & varHCCoeff,
+                             double surfaceTilt = 90,
+                             bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param varHCCoeff structure to hold variable convection coefficients boundary
+        //! conditions for transient simulations
+        //! @param surfaceTilt Surface tilt at the current boundary
+        //! @param simulateVaporFluxEnergy Flag on whether or not to calculate moisture
+        void createBC_TARPHc(size_t index1,
+                             size_t index2,
+                             const std::vector<TARPCoefficients> & varHCCoeff,
+                             double surfaceTilt = 90,
+                             bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of ASHRAE inside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        //! @param surfaceHeight Surface height at the boundary [meters]
+        //! @param surfaceTilt Surface tilt at the boundary [degrees]
+        //! @param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_ASHRAEInsideHc(size_t index1,
+                                     size_t index2,
+                                     const ASHRAEInsideCoefficients & coeff,
+                                     double surfaceHeight,
+                                     double surfaceTilt = 90,
+                                     bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of ASHRAE inside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        //! @param surfaceHeight Surface height at the boundary [meters]
+        //! @param surfaceTilt Surface tilt at the boundary [degrees]
+        //! @param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_ASHRAEInsideHc(size_t index1,
+                                     size_t index2,
+                                     const std::vector<ASHRAEInsideCoefficients> & coeff,
+                                     double surfaceHeight,
+                                     double surfaceTilt = 90,
+                                     bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of ASHRAE outside convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_ASHRAEOutsideHc(size_t index1,
+                                      size_t index2,
+                                      const ASHRAEOutsideCoefficients & coeff,
+                                      bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of ASHRAE outside convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_ASHRAEOutsideHc(size_t index1,
+                                      size_t index2,
+                                      const std::vector<ASHRAEOutsideCoefficients> & coeff,
+                                      bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of Yazdanian-Klems convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_YazdanianKlemsHc(size_t index1,
+                                      size_t index2,
+                                      const YazdanianKlemsCoefficients & coeff,
+                                      bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of Yazdanian-Klems convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_YazdanianKlemsHc(size_t index1,
+                                      size_t index2,
+                                      const std::vector<YazdanianKlemsCoefficients> & coeff,
+                                      bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of Kimura convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_KimuraHc(size_t index1,
+                                       size_t index2,
+                                       const KimuraCoefficients & coeff,
+                                       bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of Kimura convection boundary condition
+        //!
+        //! \param index1 Node 1 index
+        //! \param index2 Node 2 index
+        //! \param coeff Structure to hold coefficients that are variable through timesteps
+        //! \param simulateVaporFluxEnergy Flag to indicate whether or not energy from vapor flux
+        //! will be calculated.
+        void createBC_KimuraHc(size_t index1,
+                               size_t index2,
+                               const std::vector<KimuraCoefficients> & coeff,
+                               bool simulateVaporFluxEnergy = true);
+
+        //! \brief Creation of temperature boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Temp1 Constant temperature at node 1
+        //! @param t_Temp2 Constant temperature at node 2
+        void
+          createBC_FixedTemperature(size_t index1, size_t index2, double t_Temp1, double t_Temp2);
+
+
+        //! \brief Sets fixed temperature boundary conditions
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temp Set of node temperatures for every given timstep (each node can have
+        //! different temperature).
+        void createBC_FixedTemperature(size_t index1,
+                                       size_t index2,
+                                       const std::vector<ConstantBCTemperatures> & temp);
+
+        //! \brief Creation of temperature boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Temp Constant temperature in both nodes
+        void createBC_FixedTemperature(size_t index1, size_t index2, double t_Temp);
+
+        //! \brief Creation of temperature boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Temp Constant temperature at each timestep in both nodes
+        void createBC_FixedTemperature(size_t index1, size_t index2, std::vector<double> t_Temp);
+
+        //! \brief Creation of temperature boundary condition with a cyclic series
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temperatures Cyclic temperature series applied to both nodes
+        void createBC_PeriodicTemperature(size_t index1,
+                                          size_t index2,
+                                          PeriodicSeries temperatures);
+
+        //! \brief Creation of flux boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Flux Constant flux in both nodes
+        void createBC_FixedFlux(size_t index1, size_t index2, double t_Flux);
+
+        //! \brief Creation of flux boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Flux Constant flux in both nodes at every timestep
+        void createBC_FixedFlux(size_t index1, size_t index2, std::vector<double> t_Flux);
+
+        //! \brief Creation of flux boundary condition with a cyclic series
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param fluxes Cyclic flux series applied to both nodes
+        void createBC_PeriodicFlux(size_t index1,
+                                   size_t index2,
+                                   PeriodicSeries fluxes);
+
+        //! \brief Creation of black body radiation
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Emissivity Emissivity at boundary condition
+        //! @param t_RadiationTemperature Radiation temperature
+        void createBC_BlackBodyRadiation(size_t index1,
+                                         size_t index2,
+                                         double t_Emissivity,
+                                         double t_RadiationTemperature);
+
+        //! \brief Sets radiation boundary condition that is fixed during entire transient
+        //! simulation or set for steady-state case
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param radCoeffs Radiation coefficients for every timestep
+        void createBC_BlackBodyRadiation(
+          size_t index1,
+          size_t index2,
+          const std::vector<BlackBodyRadiationBCCoefficients> & radCoeffs);
+
+        //! \brief Creation of black body radiation with per-field cyclic series
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param emissivities Cyclic emissivity series
+        //! @param temperatures Cyclic radiation temperature series
+        void createBC_PeriodicBlackBodyRadiation(size_t index1,
+                                                  size_t index2,
+                                                  PeriodicSeries emissivities,
+                                                  PeriodicSeries temperatures);
+
+        //! \brief Creation of linearized radiation boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param linearRadBC Structure that holds coefficients for linearized radiation
+        void createBC_LinearizedRadiation(size_t index1,
+                                          size_t index2,
+                                          const LinearizedRadiationBCCoefficients & linearRadBC);
+
+        //! \brief Creation of linearized radiation boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param linearRadBC Linarized radiation boundary condition at every timestep
+        void createBC_LinearizedRadiation(
+          size_t index1,
+          size_t index2,
+          const std::vector<LinearizedRadiationBCCoefficients> & linearRadBC);
+
+        //! \brief Creation of linearized radiation with per-field cyclic series
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coefficients Cyclic radiation coefficient series
+        //! @param temperatures Cyclic radiation temperature series
+        void createBC_PeriodicLinearizedRadiation(size_t index1,
+                                                   size_t index2,
+                                                   PeriodicSeries coefficients,
+                                                   PeriodicSeries temperatures);
+
+        //! \brief Creation of enclosure radiation boundary conditions.
+        //!
+        //! Builds one shared radiosity coordinator from the segments (view factors come from the
+        //! WCE engine) and one nonlinear EnclosureRadiationBC per segment.
+        //! @param segments Enclosure radiation segments (node indices, emissivity, enclosure id).
+        //! @param openEnclosureTemperatures Environment temperature [C] for each open enclosure id.
+        //! @param smoothViewFactors Apply least-squares smoothing to closed enclosures.
+        //! @param surfaceTemperature Segment surface-temperature convention (Conrad-compatible
+        //! isothermal by default; LocalTemperature is the refined along-segment treatment).
+        void createEnclosureRadiation(
+          const std::vector<EnclosureRadiationSegment> & segments,
+          const std::map<std::size_t, double> & openEnclosureTemperatures = {},
+          bool smoothViewFactors = true,
+          EnclosureSurfaceTemperature surfaceTemperature =
+            EnclosureSurfaceTemperature::SegmentIsothermal);
+
+    protected:
+        void postProcess(std::vector<double> & solution) override;
+        void updateNodes(const std::vector<double> & solution,
+                         bool updatePreviousTimestep) override;
+
+        [[nodiscard]] Variable stateVariable() const override;
+
+        //! With the latent heat of fusion active the change-metric acceptance is unsafe:
+        //! the secant capacity kink contracts the fixed point so slowly that the metric
+        //! stagnates below any tolerance at iterates whose residual is a per-step ENERGY
+        //! imbalance (a freeze-thaw cycling benchmark lost ~4 % of its gross heat
+        //! throughput this way). Residual-reduction convergence (D3) accepts on the
+        //! actual equation error instead; fusion-off runs keep the historical metric.
+        [[nodiscard]] bool useResidualConvergence() const override;
+
+    private:
+        //! The vapor-flux-energy state a convection BC is built with: the caller's request
+        //! gated by the domain's heat-of-evaporation physics flag. Collapsed here, at BC
+        //! creation, so the BCs themselves never read the physics options.
+        [[nodiscard]] bool vaporFluxEnergyOn(bool requested) const;
+
+        //! Radiosity coordinators owned by the domain; the per-segment BCs reference them.
+        std::vector<std::unique_ptr<EnclosureRadiation>> m_EnclosureRadiations;
+    };
+}   // namespace HygroThermFEM

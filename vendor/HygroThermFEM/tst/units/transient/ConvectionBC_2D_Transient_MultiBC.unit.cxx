@@ -1,0 +1,98 @@
+#include <memory>
+#include <gtest/gtest.h>
+
+#include "HygroThermFEM2D.hxx"
+#include "TestMaterials.hxx"
+
+TEST(ConvectionBC_2D_Transient_MultiBC, TestExample_1)
+{
+    SCOPED_TRACE("Begin Test: Three elements with simple convection BC.");
+
+    HygroThermFEM::MultiDomain multiDomain({.performThermal = true, .performMoisture = false});
+
+    multiDomain.nodes().createNode({.index = 1, .x = 0.2, .y = 0.05});
+    multiDomain.nodes().createNode({.index = 2, .x = 0.2, .y = 0.00});
+    multiDomain.nodes().createNode({.index = 3, .x = 0.1, .y = 0.05});
+    multiDomain.nodes().createNode({.index = 4, .x = 0.1, .y = 0.00});
+    multiDomain.nodes().createNode({.index = 5, .x = 0.0, .y = 0.05});
+    multiDomain.nodes().createNode({.index = 6, .x = 0.0, .y = 0.00});
+
+    const auto & material = multiDomain.materials().createSolidMaterial(TestHelper::TestMaterial());
+
+    multiDomain.createElement({.node1 = 3, .node2 = 4, .node3 = 2, .node4 = 1, .material = material.name()});
+    multiDomain.createElement({.node1 = 6, .node2 = 4, .node3 = 3, .node4 = 5, .material = material.name()});
+
+    // Create Boundary Conditions
+
+    // Here we create boundary conditions for every time-step
+    const std::vector<HygroThermFEM::FixedBCHCCoefficients> bcCoeffsTransient{
+      {20.0, 2.4}, {20.0, 2.2}, {20.0, 2.0}, {18.0, 1.5}};
+    //{20.0, 2.4}, {20.0, 2.2}, {20.0, 2.0}};
+
+    constexpr auto hc2 = 15.0;
+    constexpr auto temperatureAir2 = -18.0;
+
+    const HygroThermFEM::FixedBCHCCoefficients bcCoeff2{temperatureAir2, hc2};
+
+    multiDomain.thermal().createBC_FixedHc(1, 2, bcCoeffsTransient);
+    multiDomain.thermal().createBC_FixedHc(6, 5, bcCoeff2);
+
+    constexpr auto dTime = 3600;
+    constexpr auto nSteps = 4;
+
+    auto temperatures = multiDomain.nodes().properties(HygroThermFEM::Variable::temperature);
+    std::vector<std::vector<double>> temperaturesSolution;
+    std::vector<std::vector<HygroThermFEM::NodeFlux>> fluxSolution;
+    size_t timestepIndex{0};
+
+    for(unsigned i = 0; i < nSteps; ++i)
+    {
+        temperatures = multiDomain.thermal().transient(temperatures, dTime, timestepIndex).value().solution;
+        temperaturesSolution.push_back(temperatures);
+        fluxSolution.push_back(multiDomain.thermal().flux());
+        ++timestepIndex;
+    }
+
+    std::vector<std::vector<double>> correctTemperatureSolution{
+      {1.132130505, 1.132130505, -0.656245111, -0.656245111, -5.621029352, -5.621029352},
+      {1.552647394, 1.552647394, -1.488060905, -1.488060905, -8.554988708, -8.554988708},
+      {1.502118281, 1.502118281, -2.319745532, -2.319745532, -10.16719396, -10.16719396},
+      {0.895825525, 0.895825525, -3.137113323, -3.137113323, -11.12633933, -11.12633933}};
+
+    std::vector<std::vector<HygroThermFEM::NodeFlux>> correctFluxSolution{{{-17.88375616, 0},
+                                                                           {-17.88375616, 0},
+                                                                           {-33.76579929, 0},
+                                                                           {-33.76579929, 0},
+                                                                           {-49.64784241, 0},
+                                                                           {-49.64784241, 0}},
+                                                                          {{-30.40708298, 0},
+                                                                           {-30.40708298, 0},
+                                                                           {-50.53818051, 0},
+                                                                           {-50.53818051, 0},
+                                                                           {-70.66927803, 0},
+                                                                           {-70.66927803, 0}},
+                                                                          {{-38.21863813, 0},
+                                                                           {-38.21863813, 0},
+                                                                           {-58.34656121, 0},
+                                                                           {-58.34656121, 0},
+                                                                           {-78.47448429, 0},
+                                                                           {-78.47448429, 0}},
+                                                                          {{-40.32938848, 0},
+                                                                           {-40.32938848, 0},
+                                                                           {-60.11082427, 0},
+                                                                           {-60.11082427, 0},
+                                                                           {-79.89226005, 0},
+                                                                           {-79.89226005, 0}}};
+
+    EXPECT_EQ(temperaturesSolution.size(), correctTemperatureSolution.size());
+
+    for(auto i = 0u; i < correctTemperatureSolution.size(); ++i)
+    {
+        for(auto j = 0u; j < correctTemperatureSolution[i].size(); ++j)
+        {
+            EXPECT_NEAR(correctTemperatureSolution[i][j], temperaturesSolution[i][j], 1e-6);
+            EXPECT_NEAR(correctFluxSolution[i][j].x, fluxSolution[i][j].x, 1e-6);
+            EXPECT_NEAR(correctFluxSolution[i][j].y, fluxSolution[i][j].y, 1e-6);
+        }
+    }
+}

@@ -1,0 +1,5 @@
+*.sh text eol=lf
+pyhygrothermfem_fairyfly/third_party_licenses/** -text -whitespace
+*.sh                         eol=lf
+debug/msvc/*.dat             eol=crlf
+debug/msvc/*.natvis          eol=crlf

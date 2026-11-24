@@ -1,0 +1,1809 @@
+From 4e617607b746809ad740c84a2babcb40f2545c8b Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:14:00 +0800
+Subject: [PATCH 1/6] feat: add ISO15099Ventilated cavity and optional cavity
+ conditions/emissivities
+
+---
+ src/materials/GasCavities.cxx | 38 +++++++++++++++++++++--------------
+ src/materials/Material.cxx    | 36 +++++++++++++++++++++++++++++++++
+ src/materials/Material.hxx    | 15 ++++++++++++++
+ 3 files changed, 74 insertions(+), 15 deletions(-)
+
+diff --git a/src/materials/GasCavities.cxx b/src/materials/GasCavities.cxx
+index 2e6864c..d6e1d64 100644
+--- a/src/materials/GasCavities.cxx
++++ b/src/materials/GasCavities.cxx
+@@ -47,8 +47,13 @@ namespace HygroThermFEM
+     {
+         updateSideTemperatures();
+         const auto hfDirection = heatFlowDirection();
+-        const auto side1 = getSide1(hfDirection);
+-        const auto side2 = getSide2(hfDirection);
++        auto side1 = getSide1(hfDirection);
++        auto side2 = getSide2(hfDirection);
++        if(const auto emissivities = m_Gas.sideEmissivities())
++        {
++            side1.emissivity = emissivities->first;
++            side2.emissivity = emissivities->second;
++        }
+         const auto evaluation{evaluate(hfDirection, side1, side2)};
+         m_Gas.updateThermalConductivity(evaluation.conductivity);
+         m_Gas.updateDiffusionResistanceFactor(evaluation.diffusionResistanceFactor);
+@@ -67,22 +72,25 @@ namespace HygroThermFEM
+                                     const KeffCavity::CavitySide & side2) const
+     {
+         const auto radCalc{KeffCavity::RadiationCalculation::Simplified};
+-        switch(m_Gas.standard())
++        const auto standard = m_Gas.standard();
++        switch(standard)
+         {
+             case CavityStandard::ISO15099:
++            case CavityStandard::ISO15099Ventilated:
+             {
+-                const auto jambHeight{1.0};
+-                const auto pressure{101325.0};
+-                KeffCavity::CavityISO10599 cavity(heatFlow,
+-                                                  m_Size.L,
+-                                                  m_Size.H,
+-                                                  jambHeight,
+-                                                  side1,
+-                                                  side2,
+-                                                  pressure,
+-                                                  m_GravityVector,
+-                                                  radCalc,
+-                                                  m_Gas.getGas());
++                KeffCavity::CavityISO10599 cavity(
++                  heatFlow,
++                  m_Size.L,
++                  m_Size.H,
++                  m_Gas.cavityHeight(),
++                  side1,
++                  side2,
++                  m_Gas.cavityPressure(),
++                  m_GravityVector,
++                  radCalc,
++                  m_Gas.getGas(),
++                  standard == CavityStandard::ISO15099Ventilated ? KeffCavity::Ventilated::Yes
++                                                                 : KeffCavity::Ventilated::No);
+                 return {.conductivity = cavity.effectiveConductivity(),
+                         .diffusionResistanceFactor = cavity.effectiveDiffusionResistanceFactor(),
+                         .nusselt = cavity.nusselt()};
+diff --git a/src/materials/Material.cxx b/src/materials/Material.cxx
+index 2e0b60e..e4ec60e 100644
+--- a/src/materials/Material.cxx
++++ b/src/materials/Material.cxx
+@@ -350,6 +350,42 @@ namespace HygroThermFEM
+         return m_Gas;
+     }
+ 
++    void IGas::setSideEmissivities(const double first, const double second)
++    {
++        if(!std::isfinite(first) || !std::isfinite(second) || first < 0 || first > 1
++           || second < 0 || second > 1)
++        {
++            throw std::invalid_argument("cavity side emissivities must be in [0, 1]");
++        }
++        m_SideEmissivities = std::make_pair(first, second);
++    }
++
++    std::optional<std::pair<double, double>> IGas::sideEmissivities() const
++    {
++        return m_SideEmissivities;
++    }
++
++    void IGas::setCavityConditions(const double height, const double pressure)
++    {
++        if(!std::isfinite(height) || !std::isfinite(pressure) || height <= 0
++           || pressure <= 0)
++        {
++            throw std::invalid_argument("cavity height and pressure must be positive and finite");
++        }
++        m_CavityHeight = height;
++        m_CavityPressure = pressure;
++    }
++
++    double IGas::cavityHeight() const
++    {
++        return m_CavityHeight;
++    }
++
++    double IGas::cavityPressure() const
++    {
++        return m_CavityPressure;
++    }
++
+     const double IGas::DefaultThermalConductivityDry = 0.05;
+     const double IGas::DefaultDensity = 0.0;
+     const double IGas::DefaultPorosity = 1.0;
+diff --git a/src/materials/Material.hxx b/src/materials/Material.hxx
+index 4e6122a..4bd6c78 100644
+--- a/src/materials/Material.hxx
++++ b/src/materials/Material.hxx
+@@ -50,6 +50,7 @@ namespace HygroThermFEM
+     enum class CavityStandard
+     {
+         ISO15099,
++        ISO15099Ventilated,
+         CEN
+     };
+ 
+@@ -320,11 +321,25 @@ namespace HygroThermFEM
+ 
+         [[nodiscard]] Gases::CGas & getGas();
+ 
++        void setSideEmissivities(double first, double second);
++
++        [[nodiscard]] std::optional<std::pair<double, double>> sideEmissivities() const;
++
++        void setCavityConditions(double height, double pressure);
++
++        [[nodiscard]] double cavityHeight() const;
++
++        [[nodiscard]] double cavityPressure() const;
++
+     private:
+         CavityStandard m_CavityStandard;
+ 
+         Gases::CGas m_Gas;
+ 
++        std::optional<std::pair<double, double>> m_SideEmissivities;
++        double m_CavityHeight{1.0};
++        double m_CavityPressure{101325.0};
++
+         static const double DefaultThermalConductivityDry;
+         static const double DefaultDensity;
+         static const double DefaultPorosity;
+-- 
+2.55.0.windows.2
+
+
+From 954af8a5834a450763221c61bbff9d93b2c5c6b7 Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 09:11:09 +0800
+Subject: [PATCH 2/6] fix: pass timestep index to boundary heat-rate evaluation
+
+---
+ src/domain/Domain.cxx | 5 +++--
+ src/domain/Domain.hxx | 5 ++++-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/domain/Domain.cxx b/src/domain/Domain.cxx
+index 0c015ac..7f02a2a 100644
+--- a/src/domain/Domain.cxx
++++ b/src/domain/Domain.cxx
+@@ -1308,9 +1308,10 @@ namespace HygroThermFEM
+         return m_Elements.flux(m_NodePool.maxIndex());
+     }
+ 
+-    std::vector<BoundaryHeatRate> IDomain::boundaryHeatRates(const Variable variable) const
++    std::vector<BoundaryHeatRate> IDomain::boundaryHeatRates(
++      const Variable variable, const size_t timestepIndex) const
+     {
+-        return m_BCs.heatRates(variable);
++        return m_BCs.heatRates(variable, timestepIndex);
+     }
+ 
+     const ElementsLinear2D & IDomain::elements() const
+diff --git a/src/domain/Domain.hxx b/src/domain/Domain.hxx
+index 6691dab..2cfa30a 100644
+--- a/src/domain/Domain.hxx
++++ b/src/domain/Domain.hxx
+@@ -178,7 +178,10 @@ namespace HygroThermFEM
+         //! The consistent boundary-side reintegration sum((H*u - R)) per boundary element;
+         //! positive when heat leaves the domain (see BoundaryConditions2D::heatRates).
+         //! @param variable State variable of this domain (Variable::temperature for thermal).
+-        [[nodiscard]] std::vector<BoundaryHeatRate> boundaryHeatRates(Variable variable) const;
++        //! @param timestepIndex Timestep index used to select variable boundary conditions;
++        //!                      zero for steady state or constant conditions.
++        [[nodiscard]] std::vector<BoundaryHeatRate> boundaryHeatRates(
++          Variable variable, size_t timestepIndex = 0) const;
+ 
+         //! \brief Read-only access to the domain's elements.
+         //! Used by the error-estimator adapter to assemble per-element Gauss-point data from a
+-- 
+2.55.0.windows.2
+
+
+From 31ef1e07be68a7659a095f7b54ec2d9724d646bf Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 19:01:20 +0800
+Subject: [PATCH 3/6] fix: index transient BC tables cyclically by declared
+ period
+
+forEachActiveBC indexed m_TransientBCs by the raw timestep index, forcing
+callers to expand every periodic boundary series to num_steps entries (and
+leaving an off-by-one: size() < timestepIndex let index == size read out
+of bounds). Boundary series are periodic, so index cyclically
+(timestepIndex % size); a table now needs only one entry per declared
+period, keeping per-edge memory bounded on long runs.
+---
+ src/boundary/BoundaryConditions2D.hxx | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/boundary/BoundaryConditions2D.hxx b/src/boundary/BoundaryConditions2D.hxx
+index c6736ba..1d16a7c 100644
+--- a/src/boundary/BoundaryConditions2D.hxx
++++ b/src/boundary/BoundaryConditions2D.hxx
+@@ -89,6 +89,13 @@ namespace HygroThermFEM
+     private:
+         //! Iterates over all active BCs (steady-state + transient at timestepIndex)
+         //! and calls func(const IBCLinear2D &) for each.
++        //!
++        //! A transient BC table holds one entry per period of its coefficient
++        //! series (the binding supplies compact periodic series), so the table
++        //! indexes cyclically: step t uses entry t % size. This keeps per-edge
++        //! memory proportional to the declared period instead of the number of
++        //! timesteps, which matters for long runs (e.g. year-long hourly
++        //! sequences driven by a short periodic signal).
+         template<typename Func>
+         void forEachActiveBC(size_t timestepIndex, Func func) const
+         {
+@@ -98,13 +105,12 @@ namespace HygroThermFEM
+             }
+             for(const auto & bcTimesteps : m_TransientBCs)
+             {
+-                if(bcTimesteps.size() < timestepIndex)
++                if(bcTimesteps.empty())
+                 {
+                     throw std::runtime_error(
+-                      "Number of boundary conditions provided is less then "
+-                      "number of timesteps requested.");
++                      "Transient boundary condition tables cannot be empty.");
+                 }
+-                func(*bcTimesteps[timestepIndex]);
++                func(*bcTimesteps[timestepIndex % bcTimesteps.size()]);
+             }
+         }
+     };
+-- 
+2.55.0.windows.2
+
+
+From c896fbad9435e4b30ca882caac34ca1125aff008 Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:15:13 +0800
+Subject: [PATCH 4/6] feat: index periodic BC coefficients cyclically per field
+ via selectTimestep
+
+---
+ src/boundary/BCTypes.hxx                      |  28 +++
+ src/boundary/BoundaryCondition2D.cxx          |  18 +-
+ src/boundary/BoundaryCondition2D.hxx          |   6 +
+ src/boundary/BoundaryCondition2DMoisture.cxx  |  71 ++++++++
+ src/boundary/BoundaryCondition2DMoisture.hxx  |  55 ++++++
+ src/boundary/BoundaryCondition2DThermal.cxx   | 168 +++++++++++++++++-
+ src/boundary/BoundaryCondition2DThermal.hxx   | 139 +++++++++++++++
+ .../BoundaryConditionCoefficients.hxx         |  18 ++
+ src/boundary/BoundaryConditions2D.hxx         |  19 +-
+ src/boundary/ConvectiveCoefficient.cxx        |  21 +++
+ src/boundary/ConvectiveCoefficient.hxx        |  29 +++
+ src/boundary/IBCLine2D.hxx                    |  10 ++
+ src/domain/MoistureDomain.cxx                 |  21 +++
+ src/domain/MoistureDomain.hxx                 |  20 +++
+ src/domain/MultiDomain.cxx                    |  28 +++
+ src/domain/MultiDomain.hxx                    |  22 +++
+ src/domain/ThermalDomain.cxx                  |  49 +++++
+ src/domain/ThermalDomain.hxx                  |  51 ++++++
+ 18 files changed, 761 insertions(+), 12 deletions(-)
+
+diff --git a/src/boundary/BCTypes.hxx b/src/boundary/BCTypes.hxx
+index 9eb75e6..e0dcb99 100644
+--- a/src/boundary/BCTypes.hxx
++++ b/src/boundary/BCTypes.hxx
+@@ -1,12 +1,40 @@
+ #pragma once
+ 
+ #include <array>
++#include <cstddef>
++#include <vector>
+ 
+ namespace HygroThermFEM
+ {
+     //! Number of nodes on a linear boundary segment.
+     inline constexpr std::size_t numOfBCNodes = 2;
+ 
++    //! \brief Cyclic coefficient series for a periodic boundary condition.
++    //!
++    //! One field of a time-varying boundary condition (e.g. the air
++    //! temperature of a convection pair). The series repeats with its own
++    //! period: value at timestep t is values[t % values.size()]. Because
++    //! each field cycles independently, multi-field boundary conditions
++    //! never need the combined lcm-period coefficient tables that would
++    //! explode memory on coprime periods.
++    struct PeriodicSeries
++    {
++        //! Value at a timestep, cyclically indexed; empty series yield 0 so
++        //! optional fields (e.g. air humidity on a dry convection) may be
++        //! left unpopulated.
++        [[nodiscard]] double at(const std::size_t timestep) const
++        {
++            return values.empty() ? 0.0 : values[timestep % values.size()];
++        }
++
++        [[nodiscard]] std::size_t period() const
++        {
++            return values.size();
++        }
++
++        std::vector<double> values;
++    };
++
+     //! \brief Nodal values along a two-node boundary segment, kept on the stack.
+     //!
+     //! Every boundary condition is re-evaluated once per Newton-Raphson iteration, so
+diff --git a/src/boundary/BoundaryCondition2D.cxx b/src/boundary/BoundaryCondition2D.cxx
+index e5bdec6..b9a35b8 100644
+--- a/src/boundary/BoundaryCondition2D.cxx
++++ b/src/boundary/BoundaryCondition2D.cxx
+@@ -25,6 +25,16 @@ namespace HygroThermFEM
+         m_ConvectiveCoeffCalc(std::move(convectiveCoeffCalc))
+     {}
+ 
++    double IConvectiveBCBase::airTemperature() const
++    {
++        return m_AirTemperature;
++    }
++
++    double IConvectiveBCBase::airHumidity() const
++    {
++        return m_AirHumidity;
++    }
++
+     ////////////////////////////////////////////////////////
+     /// IConvectionBC
+     ////////////////////////////////////////////////////////
+@@ -42,7 +52,7 @@ namespace HygroThermFEM
+ 
+     BCVector IConvectionBC::R_Vector() const
+     {
+-        auto rightHandSide = m_ConvectiveCoeffCalc->convectiveCoefficients() * m_AirTemperature;
++        auto rightHandSide = m_ConvectiveCoeffCalc->convectiveCoefficients() * airTemperature();
+ 
+         // Moisture is dumping some energy into domain. However, it is possible that user
+         // choose not to simulate moisture in which case energy should not be included in
+@@ -57,7 +67,7 @@ namespace HygroThermFEM
+                 const double nodeTemperature = m_Nodes[j].property(Variable::temperature);
+                 const double humidity = m_Nodes[j].property(Variable::humidity);
+                 vaporLeak[j] =
+-                  (m_AirHumidity * saturationConcentrationAtTemperature(m_AirTemperature)
++                  (airHumidity() * saturationConcentrationAtTemperature(airTemperature())
+                    - humidity * saturationConcentrationAtTemperature(nodeTemperature))
+                   * heatOfEvaporation(nodeTemperature);
+             }
+@@ -92,9 +102,9 @@ namespace HygroThermFEM
+ 
+     BCVector IMoistureBC::R_Vector() const
+     {
+-        const auto satOutside = saturationConcentrationAtTemperature(m_AirTemperature);
++        const auto satOutside = saturationConcentrationAtTemperature(airTemperature());
+         const auto gconv =
+-          m_ConvectiveCoeffCalc->waterVaporTransferCoefficient() * satOutside * m_AirHumidity;
++          m_ConvectiveCoeffCalc->waterVaporTransferCoefficient() * satOutside * airHumidity();
+         return m_PsiVector * gconv;
+     }
+ 
+diff --git a/src/boundary/BoundaryCondition2D.hxx b/src/boundary/BoundaryCondition2D.hxx
+index 8f6327d..e710c64 100644
+--- a/src/boundary/BoundaryCondition2D.hxx
++++ b/src/boundary/BoundaryCondition2D.hxx
+@@ -30,6 +30,12 @@ namespace HygroThermFEM
+                           double airHumidity,
+                           std::unique_ptr<IConvectiveCoefficient> convectiveCoeffCalc);
+ 
++        //! Air state as seen by the R/H assembly. Constant BCs return the
++        //! constructor values; periodic BCs override to read their cyclic
++        //! series at the timestep last passed to selectTimestep().
++        [[nodiscard]] virtual double airTemperature() const;
++        [[nodiscard]] virtual double airHumidity() const;
++
+         const double m_AirTemperature;
+         const double m_AirHumidity;
+         std::unique_ptr<IConvectiveCoefficient> m_ConvectiveCoeffCalc;
+diff --git a/src/boundary/BoundaryCondition2DMoisture.cxx b/src/boundary/BoundaryCondition2DMoisture.cxx
+index 645d195..0f7fb92 100644
+--- a/src/boundary/BoundaryCondition2DMoisture.cxx
++++ b/src/boundary/BoundaryCondition2DMoisture.cxx
+@@ -127,6 +127,77 @@ namespace HygroThermFEM
+                       m_Nodes, fixedBchcCoefficients.ConvectionCoefficient))
+     {}
+ 
++    /////////////////////////////////////////////////////
++    /// MoisturePeriodicConvectionBC
++    /////////////////////////////////////////////////////
++    MoisturePeriodicConvectionBC::MoisturePeriodicConvectionBC(
++      Nodes & nodePool,
++      Materials & materialPool,
++      const size_t index1,
++      const size_t index2,
++      const std::string & materialName,
++      const FixedHcPeriodicCoefficients & coefficients) :
++        IMoistureBC(nodePool,
++                    materialPool,
++                    index1,
++                    index2,
++                    materialName,
++                    coefficients.AirHumidities.at(0),
++                    coefficients.AirTemperatures.at(0),
++                    std::make_unique<PeriodicFilmCoefficient>(
++                      m_Nodes, coefficients.ConvectionCoefficients)),
++        m_AirTemperatures(coefficients.AirTemperatures),
++        m_AirHumidities(coefficients.AirHumidities)
++    {}
++
++    void MoisturePeriodicConvectionBC::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++        m_ConvectiveCoeffCalc->selectTimestep(timestepIndex);
++    }
++
++    double MoisturePeriodicConvectionBC::airTemperature() const
++    {
++        return m_AirTemperatures.at(m_Timestep);
++    }
++
++    double MoisturePeriodicConvectionBC::airHumidity() const
++    {
++        return m_AirHumidities.at(m_Timestep);
++    }
++
++    /////////////////////////////////////////////////////
++    /// MoisturePeriodicFixedHumidity
++    /////////////////////////////////////////////////////
++    MoisturePeriodicFixedHumidity::MoisturePeriodicFixedHumidity(
++      Nodes & nodePool,
++      Materials & materialPool,
++      const size_t index1,
++      const size_t index2,
++      const std::string & materialName,
++      PeriodicSeries humidities) :
++        MoisturePeriodicConvectionBC(
++          nodePool, materialPool, index1, index2, materialName,
++          {{{0.0}}, {{hugeFilmCoefficient}}, std::move(humidities)})
++    {}
++
++    BCVector MoisturePeriodicFixedHumidity::R_Vector() const
++    {
++        // Node-temperature saturation concentration on BOTH sides of the penalty
++        // row (the matrix side already uses it), so the pinned quantity is the
++        // humidity itself -- see MoistureBCFixedHumidity.
++        BCVector concentration{};
++        for(std::size_t node = 0; node < numOfBCNodes; ++node)
++        {
++            concentration[node] = saturationConcentrationAtTemperature(
++              m_Nodes[node].property(Variable::temperature));
++        }
++        const auto gconv = concentration
++                           * m_ConvectiveCoeffCalc->waterVaporTransferCoefficient()
++                           * airHumidity();
++        return m_PsiVector * gconv;
++    }
++
+     /////////////////////////////////////////////////////
+     /// MoistureBCFixedHumidity
+     /////////////////////////////////////////////////////
+diff --git a/src/boundary/BoundaryCondition2DMoisture.hxx b/src/boundary/BoundaryCondition2DMoisture.hxx
+index 606a643..224fb0f 100644
+--- a/src/boundary/BoundaryCondition2DMoisture.hxx
++++ b/src/boundary/BoundaryCondition2DMoisture.hxx
+@@ -159,6 +159,61 @@ namespace HygroThermFEM
+                           const FixedBCHCCoefficients & fixedBchcCoefficients);
+     };
+ 
++    /////////////////////////////////////////////////////
++    /// MoisturePeriodicConvectionBC
++    /////////////////////////////////////////////////////
++
++    //! \brief Moisture convection boundary condition driven by per-field cyclic
++    //! series (air humidity, air temperature and film coefficient each cycle
++    //! with their own period -- no lcm-period coefficient table).
++    class MoisturePeriodicConvectionBC : public IMoistureBC
++    {
++    public:
++        MoisturePeriodicConvectionBC(
++          Nodes & nodePool,
++          Materials & materialPool,
++          size_t index1,
++          size_t index2,
++          const std::string & materialName,
++          const FixedHcPeriodicCoefficients & coefficients);
++
++        void selectTimestep(size_t timestepIndex) override;
++
++    protected:
++        [[nodiscard]] double airTemperature() const override;
++        [[nodiscard]] double airHumidity() const override;
++
++        size_t m_Timestep{0};
++        PeriodicSeries m_AirTemperatures;
++        PeriodicSeries m_AirHumidities;
++    };
++
++    /////////////////////////////////////////////////////
++    /// MoisturePeriodicFixedHumidity
++    /////////////////////////////////////////////////////
++
++    //! \brief Humidity pin driven by a cyclic series.
++    //!
++    //! Periodic counterpart of MoistureBCFixedHumidity: the pinned relative
++    //! humidity comes from a per-edge cyclic series; the R_Vector override
++    //! keeps the node-temperature cancellation so the humidity itself is
++    //! pinned (see MoistureBCFixedHumidity).
++    class MoisturePeriodicFixedHumidity : public MoisturePeriodicConvectionBC
++    {
++    public:
++        MoisturePeriodicFixedHumidity(Nodes & nodePool,
++                                      Materials & materialPool,
++                                      size_t index1,
++                                      size_t index2,
++                                      const std::string & materialName,
++                                      PeriodicSeries humidities);
++
++        [[nodiscard]] BCVector R_Vector() const override;
++
++    private:
++        inline static const double hugeFilmCoefficient{1e18};
++    };
++
+     /////////////////////////////////////////////////////
+     /// MoistureBCFixedHumidity
+     /////////////////////////////////////////////////////
+diff --git a/src/boundary/BoundaryCondition2DThermal.cxx b/src/boundary/BoundaryCondition2DThermal.cxx
+index 2c023cd..d5ca21a 100644
+--- a/src/boundary/BoundaryCondition2DThermal.cxx
++++ b/src/boundary/BoundaryCondition2DThermal.cxx
+@@ -25,6 +25,43 @@ namespace HygroThermFEM
+                       simulateVaporFluxEnergy)
+     {}
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicConvectionBC
++    ////////////////////////////////////////////////////////
++    PeriodicConvectionBC::PeriodicConvectionBC(
++      Nodes & nodePool,
++      const size_t index1,
++      const size_t index2,
++      const FixedHcPeriodicCoefficients & coefficients,
++      const bool simulateVaporFluxEnergy) :
++        IConvectionBC(nodePool,
++                      index1,
++                      index2,
++                      coefficients.AirTemperatures.at(0),
++                      std::make_unique<PeriodicFilmCoefficient>(
++                        m_Nodes, coefficients.ConvectionCoefficients),
++                      coefficients.AirHumidities.at(0),
++                      simulateVaporFluxEnergy),
++        m_AirTemperatures(coefficients.AirTemperatures),
++        m_AirHumidities(coefficients.AirHumidities)
++    {}
++
++    void PeriodicConvectionBC::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++        m_ConvectiveCoeffCalc->selectTimestep(timestepIndex);
++    }
++
++    double PeriodicConvectionBC::airTemperature() const
++    {
++        return m_AirTemperatures.at(m_Timestep);
++    }
++
++    double PeriodicConvectionBC::airHumidity() const
++    {
++        return m_AirHumidities.at(m_Timestep);
++    }
++
+     ////////////////////////////////////////////////////////
+     /// ThermalTARPConvectionBC
+     ////////////////////////////////////////////////////////
+@@ -161,6 +198,64 @@ namespace HygroThermFEM
+         node2.setTemperature(t_Temp2);
+     }
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicTemperatureBC
++    ////////////////////////////////////////////////////////
++
++    // Same numerical pin as TemperatureBC (see the comment there): the huge
++    // film coefficient is a pin, not a physical surface, so the vapor-flux
++    // energy term stays off. The node seed uses the first series value;
++    // the per-step pinned value comes from the series on every assembly.
++    // The seed must NOT read the `temperatures` argument below: the base
++    // initializer already moved it into the coefficient aggregate, so its
++    // `at(0)` sees an emptied series and returns 0. airTemperature() at
++    // this point reads the stored series at timestep 0.
++    PeriodicTemperatureBC::PeriodicTemperatureBC(Nodes & nodePool,
++                                                  const size_t index1,
++                                                  const size_t index2,
++                                                  PeriodicSeries temperatures) :
++        PeriodicConvectionBC(nodePool,
++                             index1,
++                             index2,
++                             {std::move(temperatures),
++                              {{hugeFilmCoefficient}}, {{0.0}}},
++                             /*simulateVaporFluxEnergy=*/false)
++    {
++        auto & node1 = nodePool.getNode(index1);
++        auto & node2 = nodePool.getNode(index2);
++        const double seeded = airTemperature();
++        node1.setTemperature(seeded);
++        node2.setTemperature(seeded);
++    }
++
++    ////////////////////////////////////////////////////////
++    /// PeriodicFluxBC
++    ////////////////////////////////////////////////////////
++
++    PeriodicFluxBC::PeriodicFluxBC(Nodes & nodePool,
++                                    const size_t index1,
++                                    const size_t index2,
++                                    PeriodicSeries fluxes) :
++        IBCLinear2D(nodePool, index1, index2),
++        m_Fluxes(std::move(fluxes))
++    {}
++
++    void PeriodicFluxBC::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++    }
++
++    BCVector PeriodicFluxBC::R_Vector() const
++    {
++        return m_PsiVector * m_Fluxes.at(m_Timestep);
++    }
++
++    BCMatrix2D PeriodicFluxBC::H_Matrix() const
++    {
++        // Flux boundary conditions do not have H matrix (It is zero)
++        return BCMatrix2D{};
++    }
++
+     ////////////////////////////////////////////////////////
+     /// Flux BC
+     ////////////////////////////////////////////////////////
+@@ -203,13 +298,18 @@ namespace HygroThermFEM
+           gaussPointProperty(integrationPointIndex, Variable::temperature));
+     }
+ 
++    double IRadiationBC::radiationTemperature() const
++    {
++        return m_RadiationTemperature;
++    }
++
+     BCVector IRadiationBC::R_Vector() const
+     {
+         const auto coefficientAt = [this](const std::size_t idx)
+         {
+             return gaussRadiationCoefficient(idx);
+         };
+-        return psiGaussWeighted(coefficientAt) * m_RadiationTemperature;
++        return psiGaussWeighted(coefficientAt) * radiationTemperature();
+     }
+ 
+     BCMatrix2D IRadiationBC::H_Matrix() const
+@@ -243,6 +343,41 @@ namespace HygroThermFEM
+                * Constants::STEFANBOLTZMANN * m_Emissivity;
+     }
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicBlackBodyRadiationBC
++    ////////////////////////////////////////////////////////
++
++    PeriodicBlackBodyRadiationBC::PeriodicBlackBodyRadiationBC(
++      Nodes & nodePool,
++      const size_t index1,
++      const size_t index2,
++      PeriodicSeries emissivities,
++      PeriodicSeries temperatures) :
++        IRadiationBC(nodePool, index1, index2, temperatures.at(0), false),
++        m_Emissivities(std::move(emissivities)),
++        m_Temperatures(std::move(temperatures))
++    {}
++
++    void PeriodicBlackBodyRadiationBC::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++    }
++
++    double PeriodicBlackBodyRadiationBC::radiationTemperature() const
++    {
++        return m_Temperatures.at(m_Timestep);
++    }
++
++    double PeriodicBlackBodyRadiationBC::radiationCoefficientAt(
++      const double surfaceTemperature) const
++    {
++        const double surfaceTemp = celsiusToKelvin(surfaceTemperature);
++        const double radiationTemp = celsiusToKelvin(radiationTemperature());
++        return (surfaceTemp + radiationTemp)
++               * (radiationTemp * radiationTemp + surfaceTemp * surfaceTemp)
++               * Constants::STEFANBOLTZMANN * m_Emissivities.at(m_Timestep);
++    }
++
+     ////////////////////////////////////////////////////////
+     /// LinearizedRadiationBC
+     ////////////////////////////////////////////////////////
+@@ -260,6 +395,37 @@ namespace HygroThermFEM
+         return m_RadiationCoefficient;
+     }
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicLinearizedRadiationBC
++    ////////////////////////////////////////////////////////
++
++    PeriodicLinearizedRadiationBC::PeriodicLinearizedRadiationBC(
++      Nodes & nodePool,
++      const size_t index1,
++      const size_t index2,
++      PeriodicSeries coefficients,
++      PeriodicSeries temperatures) :
++        IRadiationBC(nodePool, index1, index2, temperatures.at(0), true),
++        m_Coefficients(std::move(coefficients)),
++        m_Temperatures(std::move(temperatures))
++    {}
++
++    void PeriodicLinearizedRadiationBC::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++    }
++
++    double PeriodicLinearizedRadiationBC::radiationTemperature() const
++    {
++        return m_Temperatures.at(m_Timestep);
++    }
++
++    double PeriodicLinearizedRadiationBC::radiationCoefficientAt(
++      const double /*surfaceTemperature*/) const
++    {
++        return m_Coefficients.at(m_Timestep);
++    }
++
+     ////////////////////////////////////////////////////////
+     /// EnclosureRadiationBC
+     ////////////////////////////////////////////////////////
+diff --git a/src/boundary/BoundaryCondition2DThermal.hxx b/src/boundary/BoundaryCondition2DThermal.hxx
+index 228caf6..d94b200 100644
+--- a/src/boundary/BoundaryCondition2DThermal.hxx
++++ b/src/boundary/BoundaryCondition2DThermal.hxx
+@@ -27,6 +27,37 @@ namespace HygroThermFEM
+                              bool simulateVaporFluxEnergy = true);
+     };
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicConvectionBC
++    ////////////////////////////////////////////////////////
++
++    //! \brief Convection boundary condition driven by per-field cyclic series.
++    //!
++    //! Memory-bounded equivalent of one ConstantConvectionBC per timestep:
++    //! air temperature, film coefficient and air humidity each cycle with
++    //! their own declared period instead of being combined into an
++    //! lcm-period coefficient table, so memory stays proportional to the
++    //! sum of the periods even for coprime periods.
++    class PeriodicConvectionBC : public IConvectionBC
++    {
++    public:
++        PeriodicConvectionBC(Nodes & nodePool,
++                             size_t index1,
++                             size_t index2,
++                             const FixedHcPeriodicCoefficients & coefficients,
++                             bool simulateVaporFluxEnergy = true);
++
++        void selectTimestep(size_t timestepIndex) override;
++
++    protected:
++        [[nodiscard]] double airTemperature() const override;
++        [[nodiscard]] double airHumidity() const override;
++
++        size_t m_Timestep{0};
++        PeriodicSeries m_AirTemperatures;
++        PeriodicSeries m_AirHumidities;
++    };
++
+     ////////////////////////////////////////////////////////
+     /// ThermalTARPConvectionBC
+     ////////////////////////////////////////////////////////
+@@ -181,6 +212,51 @@ namespace HygroThermFEM
+         inline static const double hugeFilmCoefficient{1e18};
+     };
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicTemperatureBC
++    ////////////////////////////////////////////////////////
++
++    //! \brief Fixed-temperature boundary condition driven by a cyclic series.
++    //!
++    //! Same numerical pin as TemperatureBC (huge film coefficient, vapor
++    //! flux energy off), with the pinned temperature read from a per-edge
++    //! cyclic series instead of one BC object per timestep.
++    class PeriodicTemperatureBC : public PeriodicConvectionBC
++    {
++    public:
++        PeriodicTemperatureBC(Nodes & nodePool,
++                              size_t index1,
++                              size_t index2,
++                              PeriodicSeries temperatures);
++
++    private:
++        inline static const double hugeFilmCoefficient{1e18};
++    };
++
++    ////////////////////////////////////////////////////////
++    /// PeriodicFluxBC
++    ////////////////////////////////////////////////////////
++
++    //! \brief Heat-flux boundary condition driven by a cyclic series.
++    //!
++    //! Per-edge equivalent of one FluxBC per timestep.
++    class PeriodicFluxBC : public IBCLinear2D
++    {
++    public:
++        PeriodicFluxBC(Nodes & nodePool,
++                       size_t index1,
++                       size_t index2,
++                       PeriodicSeries fluxes);
++
++        void selectTimestep(size_t timestepIndex) override;
++        [[nodiscard]] BCVector R_Vector() const override;
++        [[nodiscard]] BCMatrix2D H_Matrix() const override;
++
++    private:
++        PeriodicSeries m_Fluxes;
++        size_t m_Timestep{0};
++    };
++
+     ////////////////////////////////////////////////////////
+     /// Flux BC
+     ////////////////////////////////////////////////////////
+@@ -245,6 +321,11 @@ namespace HygroThermFEM
+         //! Radiation coefficient evaluated at one integration point of the segment.
+         [[nodiscard]] double gaussRadiationCoefficient(std::size_t integrationPointIndex) const;
+ 
++        //! Environment radiation temperature as seen by the R/H assembly.
++        //! Constant BCs return the constructor value; periodic BCs override
++        //! to read their cyclic series at the selected timestep.
++        [[nodiscard]] virtual double radiationTemperature() const;
++
+         double m_RadiationTemperature;
+     };
+ 
+@@ -277,6 +358,35 @@ namespace HygroThermFEM
+         double m_Emissivity;
+     };
+ 
++    ///////////////////////////////////////////////////////
++    /// PeriodicBlackBodyRadiationBC
++    ///////////////////////////////////////////////////////
++
++    //! \brief Black body radiation boundary condition driven by cyclic series.
++    //!
++    //! Emissivity and radiation temperature each cycle with their own
++    //! period (per-field indexing, no lcm-period coefficient table).
++    class PeriodicBlackBodyRadiationBC : public IRadiationBC
++    {
++    public:
++        PeriodicBlackBodyRadiationBC(Nodes & nodePool,
++                                     size_t index1,
++                                     size_t index2,
++                                     PeriodicSeries emissivities,
++                                     PeriodicSeries temperatures);
++
++        void selectTimestep(size_t timestepIndex) override;
++
++    protected:
++        [[nodiscard]] double radiationTemperature() const override;
++        [[nodiscard]] double radiationCoefficientAt(double surfaceTemperature) const override;
++
++    private:
++        PeriodicSeries m_Emissivities;
++        PeriodicSeries m_Temperatures;
++        size_t m_Timestep{0};
++    };
++
+     ///////////////////////////////////////////////////////
+     /// LinearizedRadiationBC
+     ///////////////////////////////////////////////////////
+@@ -301,6 +411,35 @@ namespace HygroThermFEM
+         double m_RadiationCoefficient;
+     };
+ 
++    ///////////////////////////////////////////////////////
++    /// PeriodicLinearizedRadiationBC
++    ///////////////////////////////////////////////////////
++
++    //! \brief Linearized radiation boundary condition driven by cyclic series.
++    //!
++    //! Radiation coefficient and radiation temperature each cycle with
++    //! their own period (per-field indexing).
++    class PeriodicLinearizedRadiationBC : public IRadiationBC
++    {
++    public:
++        PeriodicLinearizedRadiationBC(Nodes & nodePool,
++                                      size_t index1,
++                                      size_t index2,
++                                      PeriodicSeries coefficients,
++                                      PeriodicSeries temperatures);
++
++        void selectTimestep(size_t timestepIndex) override;
++
++    protected:
++        [[nodiscard]] double radiationTemperature() const override;
++        [[nodiscard]] double radiationCoefficientAt(double surfaceTemperature) const override;
++
++    private:
++        PeriodicSeries m_Coefficients;
++        PeriodicSeries m_Temperatures;
++        size_t m_Timestep{0};
++    };
++
+     ///////////////////////////////////////////////////////
+     /// EnclosureRadiationBC
+     ///////////////////////////////////////////////////////
+diff --git a/src/boundary/BoundaryConditionCoefficients.hxx b/src/boundary/BoundaryConditionCoefficients.hxx
+index 0720b22..1052b18 100644
+--- a/src/boundary/BoundaryConditionCoefficients.hxx
++++ b/src/boundary/BoundaryConditionCoefficients.hxx
+@@ -38,6 +38,24 @@ namespace HygroThermFEM
+         double ConvectionCoefficient{0};
+     };
+ 
++    ///////////////////////////////////////////////////////////////////////////////////////////////
++    // FixedHcPeriodicCoefficients
++    ///////////////////////////////////////////////////////////////////////////////////////////////
++
++    //! \brief Per-field cyclic coefficient series of a fixed film-coefficient
++    //! convection boundary condition.
++    //!
++    //! The periodic counterpart of vector<FixedBCHCCoefficients>: every field
++    //! cycles with its own period instead of being materialized as one
++    //! combined lcm-period table entry per timestep. AirHumidities may be
++    //! left empty for dry convection (evaluates as 0).
++    struct FixedHcPeriodicCoefficients
++    {
++        PeriodicSeries AirTemperatures;
++        PeriodicSeries ConvectionCoefficients;
++        PeriodicSeries AirHumidities;
++    };
++
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+     // TemperatureAndHumidity
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/src/boundary/BoundaryConditions2D.hxx b/src/boundary/BoundaryConditions2D.hxx
+index 1d16a7c..3c8f636 100644
+--- a/src/boundary/BoundaryConditions2D.hxx
++++ b/src/boundary/BoundaryConditions2D.hxx
+@@ -90,17 +90,20 @@ namespace HygroThermFEM
+         //! Iterates over all active BCs (steady-state + transient at timestepIndex)
+         //! and calls func(const IBCLinear2D &) for each.
+         //!
+-        //! A transient BC table holds one entry per period of its coefficient
+-        //! series (the binding supplies compact periodic series), so the table
+-        //! indexes cyclically: step t uses entry t % size. This keeps per-edge
+-        //! memory proportional to the declared period instead of the number of
+-        //! timesteps, which matters for long runs (e.g. year-long hourly
+-        //! sequences driven by a short periodic signal).
++        //! Two periodic mechanisms coexist here. A legacy transient table
++        //! (m_TransientBCs) holds one BC object per combined series period
++        //! and indexes cyclically: step t uses entry t % size. Periodic BC
++        //! objects (the preferred bounded-memory form, one object per edge)
++        //! hold their coefficient fields as independent cyclic series and
++        //! receive the timestep through selectTimestep() before evaluation.
++        //! Both keep per-edge memory proportional to the declared periods
++        //! instead of the number of timesteps.
+         template<typename Func>
+         void forEachActiveBC(size_t timestepIndex, Func func) const
+         {
+             for(const auto & bcPtr : m_BCs)
+             {
++                bcPtr->selectTimestep(timestepIndex);
+                 func(*bcPtr);
+             }
+             for(const auto & bcTimesteps : m_TransientBCs)
+@@ -110,7 +113,9 @@ namespace HygroThermFEM
+                     throw std::runtime_error(
+                       "Transient boundary condition tables cannot be empty.");
+                 }
+-                func(*bcTimesteps[timestepIndex % bcTimesteps.size()]);
++                auto & bc = *bcTimesteps[timestepIndex % bcTimesteps.size()];
++                bc.selectTimestep(timestepIndex);
++                func(bc);
+             }
+         }
+     };
+diff --git a/src/boundary/ConvectiveCoefficient.cxx b/src/boundary/ConvectiveCoefficient.cxx
+index eccb7d0..f01fc96 100644
+--- a/src/boundary/ConvectiveCoefficient.cxx
++++ b/src/boundary/ConvectiveCoefficient.cxx
+@@ -65,6 +65,27 @@ namespace HygroThermFEM
+         return result;
+     }
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicFilmCoefficient
++    ////////////////////////////////////////////////////////
++
++    PeriodicFilmCoefficient::PeriodicFilmCoefficient(const INodes & nodes,
++                                                     PeriodicSeries series) :
++        IConvectiveCoefficient(nodes), m_Series(std::move(series))
++    {}
++
++    BCVector PeriodicFilmCoefficient::convectiveCoefficients() const
++    {
++        BCVector result{};
++        result.fill(m_Series.at(m_Timestep));
++        return result;
++    }
++
++    void PeriodicFilmCoefficient::selectTimestep(const size_t timestepIndex)
++    {
++        m_Timestep = timestepIndex;
++    }
++
+     ////////////////////////////////////////////////////////
+     /// TARPFilmCoefficient
+     ////////////////////////////////////////////////////////
+diff --git a/src/boundary/ConvectiveCoefficient.hxx b/src/boundary/ConvectiveCoefficient.hxx
+index eafbc01..206253b 100644
+--- a/src/boundary/ConvectiveCoefficient.hxx
++++ b/src/boundary/ConvectiveCoefficient.hxx
+@@ -27,6 +27,12 @@ namespace HygroThermFEM
+         IConvectiveCoefficient & operator=(IConvectiveCoefficient && other) = delete;
+         [[nodiscard]] virtual BCVector convectiveCoefficients() const = 0;
+ 
++        //! Selects the timestep the next coefficient evaluation applies to.
++        //! Constant models ignore it; periodic models override it to index
++        //! their film-coefficient series by its own period.
++        virtual void selectTimestep(size_t /*timestepIndex*/)
++        {}
++
+         //! \brief Per-node surface vapor transfer coefficient by the Lewis relation,
+         //! beta = h_c / (rho_air Cp_air), tapered to zero above saturation.
+         //!
+@@ -58,6 +64,29 @@ namespace HygroThermFEM
+         double m_ConvectionFilmCoefficient;
+     };
+ 
++    ////////////////////////////////////////////////////////
++    /// PeriodicFilmCoefficient
++    ////////////////////////////////////////////////////////
++
++    //! \brief Film coefficient driven by a cyclic timestep series.
++    //!
++    //! Holds the declared series once (memory proportional to the period,
++    //! not to the number of timesteps) and indexes it cyclically whenever
++    //! the owning boundary condition selects a timestep.
++    class PeriodicFilmCoefficient : public IConvectiveCoefficient
++    {
++    public:
++        PeriodicFilmCoefficient(const INodes & nodes, PeriodicSeries series);
++
++        [[nodiscard]] BCVector convectiveCoefficients() const override;
++
++        void selectTimestep(size_t timestepIndex) override;
++
++    private:
++        PeriodicSeries m_Series;
++        size_t m_Timestep{0};
++    };
++
+     ////////////////////////////////////////////////////////
+     /// TARPFilmCoefficient
+     ////////////////////////////////////////////////////////
+diff --git a/src/boundary/IBCLine2D.hxx b/src/boundary/IBCLine2D.hxx
+index 5df17ca..44e93bd 100644
+--- a/src/boundary/IBCLine2D.hxx
++++ b/src/boundary/IBCLine2D.hxx
+@@ -52,6 +52,16 @@ namespace HygroThermFEM
+         //! Shows if boundary condition is linear or not.
+         bool isLinear() const;
+ 
++        //! Selects the timestep the next R_Vector/H_Matrix evaluation
++        //! applies to.
++        //!
++        //! Steady and single-coefficient boundary conditions ignore it;
++        //! periodic boundary conditions override it to index each of their
++        //! coefficient fields by its own period. BoundaryConditions2D calls
++        //! this before every assembly/heat-rate evaluation.
++        virtual void selectTimestep(size_t /*timestepIndex*/)
++        {}
++
+     protected:
+         //! Returns number of integration points.
+         static std::size_t numOfIntegrationPoints();
+diff --git a/src/domain/MoistureDomain.cxx b/src/domain/MoistureDomain.cxx
+index 62fcb72..934eea1 100644
+--- a/src/domain/MoistureDomain.cxx
++++ b/src/domain/MoistureDomain.cxx
+@@ -160,6 +160,27 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void MoistureDomain::createBC_PeriodicHc(
++      const size_t index1,
++      const size_t index2,
++      const FixedHcPeriodicCoefficients & coefficients)
++    {
++        auto & Material = m_Elements.findElement(index1, index2)->getMaterial();
++        m_BCs.assignBC(std::make_unique<MoisturePeriodicConvectionBC>(
++          m_NodePool, m_MaterialPool, index1, index2, Material.name(),
++          coefficients));
++    }
++
++    void MoistureDomain::createBC_PeriodicHumidity(const size_t index1,
++                                                    const size_t index2,
++                                                    PeriodicSeries humidities)
++    {
++        auto & Material = m_Elements.findElement(index1, index2)->getMaterial();
++        m_BCs.assignBC(std::make_unique<MoisturePeriodicFixedHumidity>(
++          m_NodePool, m_MaterialPool, index1, index2, Material.name(),
++          std::move(humidities)));
++    }
++
+     std::optional<std::pair<double, double>> MoistureDomain::solutionBounds() const
+     {
+         return std::pair{0.0, 1.0};
+diff --git a/src/domain/MoistureDomain.hxx b/src/domain/MoistureDomain.hxx
+index 7c11ef2..4136aa8 100644
+--- a/src/domain/MoistureDomain.hxx
++++ b/src/domain/MoistureDomain.hxx
+@@ -149,6 +149,18 @@ namespace HygroThermFEM
+                               size_t index2,
+                               const std::vector<FixedBCHCCoefficients> & fixedBchcCoefficients);
+ 
++        //! \brief Creation of convection boundary condition with cyclic series
++        //!
++        //! Per-field counterpart of the timestep table: air humidity, air
++        //! temperature and film coefficient each cycle with their own period.
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param coefficients Per-field cyclic series (air temperature, film
++        //! coefficient, air humidity -- all three required on the moisture side)
++        void createBC_PeriodicHc(size_t index1,
++                                 size_t index2,
++                                 const FixedHcPeriodicCoefficients & coefficients);
++
+         //! \brief Creation constant temperature and humidity boundary condition
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+@@ -161,6 +173,14 @@ namespace HygroThermFEM
+         //! @param values structure to hold fixed temperature and humidity for every timestep
+         void createBC_FixedHumidity(size_t index1, size_t index2, const std::vector<TemperatureAndHumidity> & values);
+ 
++        //! \brief Creation of humidity pin with a cyclic series
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param humidities Cyclic relative-humidity series pinned at the edge
++        void createBC_PeriodicHumidity(size_t index1,
++                                       size_t index2,
++                                       PeriodicSeries humidities);
++
+     protected:
+         void postProcess(std::vector<double> & solution) override;
+         bool limitIncrement(const std::vector<double> & currentSolution,
+diff --git a/src/domain/MultiDomain.cxx b/src/domain/MultiDomain.cxx
+index 3df4c51..49b2e7f 100644
+--- a/src/domain/MultiDomain.cxx
++++ b/src/domain/MultiDomain.cxx
+@@ -559,6 +559,19 @@ namespace HygroThermFEM
+         }
+     }
+ 
++    void MultiDomain::createBC_PeriodicHc(
++      const size_t index1,
++      const size_t index2,
++      const FixedHcPeriodicCoefficients & coefficients)
++    {
++        m_ThermalDomain.createBC_PeriodicHc(
++          index1, index2, coefficients, m_SimulateMoisture);
++        if(m_SimulateMoisture)
++        {
++            m_MoistureDomain.createBC_PeriodicHc(index1, index2, coefficients);
++        }
++    }
++
+     void MultiDomain::createBC_TARPHc(size_t index1,
+                                       size_t index2,
+                                       const TARPCoefficients & varHCCoeff,
+@@ -730,6 +743,21 @@ namespace HygroThermFEM
+         }
+     }
+ 
++    void MultiDomain::createBC_PeriodicTemperatureAndHumidity(
++      const size_t index1,
++      const size_t index2,
++      PeriodicSeries temperatures,
++      PeriodicSeries humidities)
++    {
++        m_ThermalDomain.createBC_PeriodicTemperature(
++          index1, index2, std::move(temperatures));
++        if(m_SimulateMoisture)
++        {
++            m_MoistureDomain.createBC_PeriodicHumidity(
++              index1, index2, std::move(humidities));
++        }
++    }
++
+     void MultiDomain::createBC_FixedHeatFlux(size_t index1, size_t index2, double t_Flux)
+     {
+         m_ThermalDomain.createBC_FixedFlux(index1, index2, t_Flux);
+diff --git a/src/domain/MultiDomain.hxx b/src/domain/MultiDomain.hxx
+index 4d230f4..d55f3fe 100644
+--- a/src/domain/MultiDomain.hxx
++++ b/src/domain/MultiDomain.hxx
+@@ -183,6 +183,16 @@ namespace HygroThermFEM
+                               size_t index2,
+                               const std::vector<FixedBCHCCoefficients> & fixedBchcCoefficients);
+ 
++        //! \brief Creates convection boundary condition with per-field cyclic
++        //! series (thermal + moisture domains when moisture is simulated).
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param coefficients Cyclic series for air temperature, film
++        //! coefficient and air humidity, each cycling with its own period
++        void createBC_PeriodicHc(size_t index1,
++                                 size_t index2,
++                                 const FixedHcPeriodicCoefficients & coefficients);
++
+         //! \brief Creates boundary condition with coefficients that are identical during the entire
+         //! transient simulation or in steady-state calculations
+         //! @param index1 Node 1 index
+@@ -327,6 +337,18 @@ namespace HygroThermFEM
+         //! @param values Temperature and humidity values that will be set at the nodes
+         void createBC_FixedTemperatureAndHumidity(size_t index1, size_t index2, const std::vector<TemperatureAndHumidity> & values);
+ 
++        //! \brief Sets cyclic temperature and humidity pins at the boundary
++        //!
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param temperatures Cyclic temperature pin series
++        //! @param humidities Cyclic humidity pin series
++        void createBC_PeriodicTemperatureAndHumidity(
++          size_t index1,
++          size_t index2,
++          PeriodicSeries temperatures,
++          PeriodicSeries humidities);
++
+         //! \brief Creation of flux boundary condition
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+diff --git a/src/domain/ThermalDomain.cxx b/src/domain/ThermalDomain.cxx
+index 9082a31..d0d6a57 100644
+--- a/src/domain/ThermalDomain.cxx
++++ b/src/domain/ThermalDomain.cxx
+@@ -37,6 +37,17 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void ThermalDomain::createBC_PeriodicHc(
++      const size_t index1,
++      const size_t index2,
++      const FixedHcPeriodicCoefficients & coefficients,
++      const bool calculateMoisture)
++    {
++        m_BCs.assignBC(std::make_unique<PeriodicConvectionBC>(
++          m_NodePool, index1, index2, coefficients,
++          vaporFluxEnergyOn(calculateMoisture)));
++    }
++
+     void ThermalDomain::createBC_TARPHc(const size_t index1,
+                                         const size_t index2,
+                                         const TARPCoefficients & varHCCoeff,
+@@ -199,6 +210,14 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void ThermalDomain::createBC_PeriodicTemperature(const size_t index1,
++                                                      const size_t index2,
++                                                      PeriodicSeries temperatures)
++    {
++        m_BCs.assignBC(std::make_unique<PeriodicTemperatureBC>(
++          m_NodePool, index1, index2, std::move(temperatures)));
++    }
++
+     void ThermalDomain::createBC_FixedFlux(const size_t index1,
+                                            const size_t index2,
+                                            const double t_Flux)
+@@ -216,6 +235,14 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void ThermalDomain::createBC_PeriodicFlux(const size_t index1,
++                                               const size_t index2,
++                                               PeriodicSeries fluxes)
++    {
++        m_BCs.assignBC(std::make_unique<PeriodicFluxBC>(
++          m_NodePool, index1, index2, std::move(fluxes)));
++    }
++
+     void ThermalDomain::createBC_BlackBodyRadiation(const size_t index1,
+                                                     const size_t index2,
+                                                     const double t_Emissivity,
+@@ -236,6 +263,17 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void ThermalDomain::createBC_PeriodicBlackBodyRadiation(
++      const size_t index1,
++      const size_t index2,
++      PeriodicSeries emissivities,
++      PeriodicSeries temperatures)
++    {
++        m_BCs.assignBC(std::make_unique<PeriodicBlackBodyRadiationBC>(
++          m_NodePool, index1, index2, std::move(emissivities),
++          std::move(temperatures)));
++    }
++
+     void ThermalDomain::createBC_LinearizedRadiation(
+       const size_t index1,
+       const size_t index2,
+@@ -256,6 +294,17 @@ namespace HygroThermFEM
+         m_BCs.assignTimestepBCs(std::move(timestepBCs));
+     }
+ 
++    void ThermalDomain::createBC_PeriodicLinearizedRadiation(
++      const size_t index1,
++      const size_t index2,
++      PeriodicSeries coefficients,
++      PeriodicSeries temperatures)
++    {
++        m_BCs.assignBC(std::make_unique<PeriodicLinearizedRadiationBC>(
++          m_NodePool, index1, index2, std::move(coefficients),
++          std::move(temperatures)));
++    }
++
+     void ThermalDomain::clearModel()
+     {
+         IDomain::clearModel();
+diff --git a/src/domain/ThermalDomain.hxx b/src/domain/ThermalDomain.hxx
+index b1e6424..0818e76 100644
+--- a/src/domain/ThermalDomain.hxx
++++ b/src/domain/ThermalDomain.hxx
+@@ -63,6 +63,21 @@ namespace HygroThermFEM
+                               const std::vector<FixedBCHCCoefficients> & fixedBCHCCoefficients,
+                               bool calculateMoisture = true);
+ 
++        //! \brief Creation of convection boundary condition with cyclic series
++        //!
++        //! Memory-bounded alternative to the timestep table: each field of the
++        //! coefficients cycles with its own declared period (per-field indexing,
++        //! no combined lcm-period table).
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param coefficients Per-field cyclic series (air temperature, film
++        //! coefficient, air humidity)
++        //! @param calculateMoisture Flag on whether or not to calculate moisture
++        void createBC_PeriodicHc(size_t index1,
++                                 size_t index2,
++                                 const FixedHcPeriodicCoefficients & coefficients,
++                                 bool calculateMoisture = true);
++
+         //! \brief Creation of convection boundary condition
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+@@ -223,6 +238,14 @@ namespace HygroThermFEM
+         //! @param t_Temp Constant temperature at each timestep in both nodes
+         void createBC_FixedTemperature(size_t index1, size_t index2, std::vector<double> t_Temp);
+ 
++        //! \brief Creation of temperature boundary condition with a cyclic series
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param temperatures Cyclic temperature series applied to both nodes
++        void createBC_PeriodicTemperature(size_t index1,
++                                          size_t index2,
++                                          PeriodicSeries temperatures);
++
+         //! \brief Creation of flux boundary condition
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+@@ -235,6 +258,14 @@ namespace HygroThermFEM
+         //! @param t_Flux Constant flux in both nodes at every timestep
+         void createBC_FixedFlux(size_t index1, size_t index2, std::vector<double> t_Flux);
+ 
++        //! \brief Creation of flux boundary condition with a cyclic series
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param fluxes Cyclic flux series applied to both nodes
++        void createBC_PeriodicFlux(size_t index1,
++                                   size_t index2,
++                                   PeriodicSeries fluxes);
++
+         //! \brief Creation of black body radiation
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+@@ -255,6 +286,16 @@ namespace HygroThermFEM
+           size_t index2,
+           const std::vector<BlackBodyRadiationBCCoefficients> & radCoeffs);
+ 
++        //! \brief Creation of black body radiation with per-field cyclic series
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param emissivities Cyclic emissivity series
++        //! @param temperatures Cyclic radiation temperature series
++        void createBC_PeriodicBlackBodyRadiation(size_t index1,
++                                                  size_t index2,
++                                                  PeriodicSeries emissivities,
++                                                  PeriodicSeries temperatures);
++
+         //! \brief Creation of linearized radiation boundary condition
+         //! @param index1 Node 1 index
+         //! @param index2 Node 2 index
+@@ -272,6 +313,16 @@ namespace HygroThermFEM
+           size_t index2,
+           const std::vector<LinearizedRadiationBCCoefficients> & linearRadBC);
+ 
++        //! \brief Creation of linearized radiation with per-field cyclic series
++        //! @param index1 Node 1 index
++        //! @param index2 Node 2 index
++        //! @param coefficients Cyclic radiation coefficient series
++        //! @param temperatures Cyclic radiation temperature series
++        void createBC_PeriodicLinearizedRadiation(size_t index1,
++                                                   size_t index2,
++                                                   PeriodicSeries coefficients,
++                                                   PeriodicSeries temperatures);
++
+         //! \brief Creation of enclosure radiation boundary conditions.
+         //!
+         //! Builds one shared radiosity coordinator from the segments (view factors come from the
+-- 
+2.55.0.windows.2
+
+
+From cae145582d7f37dbbc9f658267f3bc47ebc4b2ac Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:20:56 +0800
+Subject: [PATCH 5/6] feat: accumulate per-step boundary exchange over accepted
+ substeps
+
+---
+ src/domain/Domain.cxx      | 24 ++++++++++++++++++++++++
+ src/domain/Domain.hxx      | 28 ++++++++++++++++++++++++++++
+ src/domain/MultiDomain.cxx | 26 ++++++++++++++++++++++++++
+ src/domain/MultiDomain.hxx | 32 ++++++++++++++++++++++++++++++++
+ 4 files changed, 110 insertions(+)
+
+diff --git a/src/domain/Domain.cxx b/src/domain/Domain.cxx
+index 7f02a2a..5e20984 100644
+--- a/src/domain/Domain.cxx
++++ b/src/domain/Domain.cxx
+@@ -891,6 +891,10 @@ namespace HygroThermFEM
+             printNRHeader(*m_DiagStream, currentStateValues.size());
+         }
+ 
++        // The pending boundary-exchange ledger belongs to this call alone; a
++        // discarded moisture solve or a coupling probe replaces it wholesale.
++        m_PendingBoundaryExchange.clear();
++
+         // Try to solve at the requested dt. If NR fails to converge, subdivide
+         // and try again with a smaller dt. Return after the FIRST successful
+         // solve, reporting the actual dt used. The caller (MultiDomain) is
+@@ -910,8 +914,15 @@ namespace HygroThermFEM
+                 // chain. Single-shot: if the resolved step still ends at a bound, that is
+                 // accepted as physical.
+                 retriedForBoundHit = true;
++                // The single-shot solve is discarded: drop its exchange so only the
++                // shock chain's own micro-steps are booked.
++                m_PendingBoundaryExchange.clear();
+                 result = resolveShockStep(currentStateValues, currentDTime, timestepIndex);
+             }
++            else if(result.converged)
++            {
++                accumulateBoundaryExchange(currentDTime, timestepIndex);
++            }
+ 
+             if(result.converged)
+             {
+@@ -966,6 +977,9 @@ namespace HygroThermFEM
+             {
+                 break;
+             }
++            // Each accepted shock micro-step is real marching time; book its
++            // boundary exchange at its own sub-DTime.
++            accumulateBoundaryExchange(subDTime, timestepIndex);
+             values = result.solution;
+         }
+ 
+@@ -1314,6 +1328,16 @@ namespace HygroThermFEM
+         return m_BCs.heatRates(variable, timestepIndex);
+     }
+ 
++    void IDomain::accumulateBoundaryExchange(const double dTime,
++                                             const size_t timestepIndex)
++    {
++        for(const auto & rate : boundaryHeatRates(stateVariable(), timestepIndex))
++        {
++            m_PendingBoundaryExchange[{rate.node1, rate.node2}] +=
++              rate.heatRate * dTime;
++        }
++    }
++
+     const ElementsLinear2D & IDomain::elements() const
+     {
+         return m_Elements;
+diff --git a/src/domain/Domain.hxx b/src/domain/Domain.hxx
+index 2cfa30a..f32f4d8 100644
+--- a/src/domain/Domain.hxx
++++ b/src/domain/Domain.hxx
+@@ -2,6 +2,7 @@
+ 
+ #include <iosfwd>
+ #include <limits>
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+@@ -183,6 +184,22 @@ namespace HygroThermFEM
+         [[nodiscard]] std::vector<BoundaryHeatRate> boundaryHeatRates(
+           Variable variable, size_t timestepIndex = 0) const;
+ 
++        //! \brief Boundary exchange accumulated over the accepted sub-steps of the most
++        //! recent transient() call, keyed by the two FEM node indexes of each boundary
++        //! element. Each accepted sub-step contributes rate * dt evaluated on the accepted
++        //! state of that sub-step (post-acceptance evaluation, including shock-chain
++        //! micro-steps); discarded attempts and non-converged retries contribute nothing.
++        //! The map is rebuilt on every transient() call, so coupling probes or redo solves
++        //! leave behind only their own interval's exchange -- the caller must merge a value
++        //! into its own ledger only when the whole coupled sub-step is accepted.
++        //! Units are energy/mass rate times seconds per metre of depth (J/m for the
++        //! thermal domain, kg/m for the moisture domain), outward-positive.
++        [[nodiscard]] std::map<std::pair<size_t, size_t>, double>
++          pendingBoundaryExchange() const
++        {
++            return m_PendingBoundaryExchange;
++        }
++
+         //! \brief Read-only access to the domain's elements.
+         //! Used by the error-estimator adapter to assemble per-element Gauss-point data from a
+         //! solved domain.
+@@ -532,6 +549,17 @@ namespace HygroThermFEM
+ 
+         [[nodiscard]] bool lastSolveAtPhysicalBound() const;
+ 
++        //! Adds rate * dTime for every active boundary element to the pending exchange
++        //! ledger. Called once per accepted sub-step (and per accepted shock-chain
++        //! micro-step), after the accepted solution has been written back to the nodes,
++        //! so heatRates evaluates the state the accepted step was solved on.
++        void accumulateBoundaryExchange(double dTime, size_t timestepIndex);
++
++        //! Exchange accumulated over the accepted sub-steps of the current transient()
++        //! call; cleared at each transient() entry and at each internal shock-chain redo
++        //! so only the final accepted work of the call is reported.
++        std::map<std::pair<size_t, size_t>, double> m_PendingBoundaryExchange;
++
+         std::ostream * m_DiagStream{nullptr};
+     };
+ 
+diff --git a/src/domain/MultiDomain.cxx b/src/domain/MultiDomain.cxx
+index 49b2e7f..e5dffb1 100644
+--- a/src/domain/MultiDomain.cxx
++++ b/src/domain/MultiDomain.cxx
+@@ -96,6 +96,11 @@ namespace HygroThermFEM
+         double totalTime{0};
+         size_t subStep{0};
+ 
++        // The step ledgers belong to this public timestep alone; each call
++        // restarts them so a stale ledger is never reported after a failure.
++        m_StepBoundaryHeatExchange.clear();
++        m_StepBoundaryWaterExchange.clear();
++
+         auto temperatureError{std::numeric_limits<double>::max()};
+         auto humidityError{std::numeric_limits<double>::max()};
+ 
+@@ -163,6 +168,17 @@ namespace HygroThermFEM
+             // Accept solutions and exchange cross-coupling data.
+             currentHumidity = humiditySolution.solution;
+             currentTemperature = temperatureSolution.solution;
++
++            // Commit the boundary exchange of this accepted coupled sub-step.
++            // Each domain's pending ledger covers exactly its final accepted
++            // solve call (a discarded moisture attempt or a coupling probe is
++            // overwritten by the next call's fresh pending), so merging here
++            // books accepted work only.
++            mergeBoundaryExchange(
++              m_StepBoundaryHeatExchange, m_ThermalDomain.pendingBoundaryExchange());
++            mergeBoundaryExchange(
++              m_StepBoundaryWaterExchange, m_MoistureDomain.pendingBoundaryExchange());
++
+             m_Nodes.updateNodeTemperatures(currentTemperature, false);
+             m_Nodes.updateNodeHumidities(currentHumidity, false);
+             if(!physicsOptions().excludeLatentHeatOfFusion)
+@@ -827,6 +843,16 @@ namespace HygroThermFEM
+         return std::abs(norm1 - norm2) / norm1;
+     }
+ 
++    void MultiDomain::mergeBoundaryExchange(
++      std::map<std::pair<size_t, size_t>, double> & ledger,
++      const std::map<std::pair<size_t, size_t>, double> & pending)
++    {
++        for(const auto & [edge, exchange] : pending)
++        {
++            ledger[edge] += exchange;
++        }
++    }
++
+     std::vector<double> MultiDomain::property(const Variable property) const
+     {
+         return m_Nodes.properties(property);
+diff --git a/src/domain/MultiDomain.hxx b/src/domain/MultiDomain.hxx
+index d55f3fe..feda1df 100644
+--- a/src/domain/MultiDomain.hxx
++++ b/src/domain/MultiDomain.hxx
+@@ -1,7 +1,9 @@
+ #pragma once
+ 
+ #include <iosfwd>
++#include <map>
+ #include <optional>
++#include <utility>
+ 
+ #include "Domain.hxx"
+ #include "ThermalDomain.hxx"
+@@ -494,6 +496,26 @@ namespace HygroThermFEM
+         //! @return Const reference to the NodePool instance
+         [[nodiscard]] const Nodes & nodes() const;
+ 
++        //! \brief Boundary heat exchange booked by the most recent transient() call,
++        //! summed over every accepted coupled sub-step (including internal subdivision
++        //! and shock-chain micro-steps). Keyed by the boundary element's FEM node
++        //! indexes; units J/m, outward-positive. Evaluated post-acceptance on each
++        //! sub-step's accepted state. Empty when thermal simulation is off.
++        [[nodiscard]] const std::map<std::pair<size_t, size_t>, double> &
++          stepBoundaryHeatExchange() const
++        {
++            return m_StepBoundaryHeatExchange;
++        }
++
++        //! \brief Boundary moisture exchange booked by the most recent transient()
++        //! call; same conventions as stepBoundaryHeatExchange(), units kg/m.
++        //! Empty when moisture simulation is off.
++        [[nodiscard]] const std::map<std::pair<size_t, size_t>, double> &
++          stepBoundaryWaterExchange() const
++        {
++            return m_StepBoundaryWaterExchange;
++        }
++
+     private:
+         //! \brief Checks validity of materials for transient simulation
+         [[nodiscard]] MaterialsErrorCheckVector checkMaterialsForTransientSimulation() const;
+@@ -503,6 +525,11 @@ namespace HygroThermFEM
+ 
+         static double normError(const std::vector<double> & vec1, const std::vector<double> & vec2);
+ 
++        //! Merges one domain's pending per-call boundary exchange into a step ledger.
++        static void mergeBoundaryExchange(
++          std::map<std::pair<size_t, size_t>, double> & ledger,
++          const std::map<std::pair<size_t, size_t>, double> & pending);
++
+         //! The two fields a steady pass carries between the domains.
+         struct SteadyFields
+         {
+@@ -566,6 +593,11 @@ namespace HygroThermFEM
+ 
+         //! Optional injected physics flags. Empty means "read the global singleton live".
+         std::optional<PhysicsOptions> m_PhysicsOptions;
++
++        //! Boundary exchange booked per public timestep: accepted sub-step sums
++        //! committed only after both coupled solves of a sub-step succeed.
++        std::map<std::pair<size_t, size_t>, double> m_StepBoundaryHeatExchange;
++        std::map<std::pair<size_t, size_t>, double> m_StepBoundaryWaterExchange;
+     };
+ 
+ }   // namespace HygroThermFEM
+-- 
+2.55.0.windows.2
+
+
+From 99d942109ee5c38c5651e3582d23fccf1fa9b7f2 Mon Sep 17 00:00:00 2001
+From: Lofty Tao <178095221+LoftyTao@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:07:39 +0800
+Subject: [PATCH 6/6] fix: extrapolate Q4 fluxes from all four Gauss points to
+ corner nodes
+
+---
+ src/elements/Element2D.cxx | 76 ++++++++++++++++++--------------------
+ 1 file changed, 36 insertions(+), 40 deletions(-)
+
+diff --git a/src/elements/Element2D.cxx b/src/elements/Element2D.cxx
+index 9b965dd..5546da5 100644
+--- a/src/elements/Element2D.cxx
++++ b/src/elements/Element2D.cxx
+@@ -397,61 +397,57 @@ namespace HygroThermFEM
+ 
+     std::vector<NodeFlux> IElementLinear2D::flux() const
+     {
+-        // Every registered term adds to the one flux of the element: the vapour and the
+-        // liquid flux of the moisture element are one water flux. Each term differentiates
+-        // the potential it transports, the state scaled by its nodal factor when it has one.
++        const auto gaussFlux = fluxAtGaussPoints();
++        // Invert the 2x2 Gauss shape-function matrix. Each corner consumes all
++        // four integration-point vectors, after transport contributions sum.
++        constexpr double a = 1.0 + std::numbers::sqrt3 / 2.0;
++        constexpr double b = -0.5;
++        constexpr double c = 1.0 - std::numbers::sqrt3 / 2.0;
++        constexpr std::array<std::array<double, 4>, 4> extrapolation{
++          {{a, b, c, b}, {b, a, b, c}, {c, b, a, b}, {b, c, b, a}}};
++        std::vector<NodeFlux> results(numOfQuadrilateralNodes, {0.0, 0.0});
++        for(std::size_t corner = 0; corner < numOfQuadrilateralNodes; ++corner)
++        {
++            for(std::size_t point = 0; point < gaussFlux.size(); ++point)
++            {
++                results[corner].x += extrapolation[corner][point] * gaussFlux[point].x;
++                results[corner].y += extrapolation[corner][point] * gaussFlux[point].y;
++            }
++        }
++        return results;
++    }
++
++    std::vector<NodeFlux> IElementLinear2D::fluxAtGaussPoints() const
++    {
+         const auto state = m_Nodes.properties(m_FluxVariable);
+-        std::vector<NodeFlux> results(numOfQuadrilateralNodes, NodeFlux{0.0, 0.0});
++        const auto & localElement = QuadrilateralLinearLocal2D::Instance();
++        const auto count = IntegrationPoints2D::Instance().count2D();
++        std::vector<NodeFlux> result(count, {0.0, 0.0});
+         for(const auto & term : m_ConductanceFunctions)
+         {
++            const auto coefficients = term.coefficient->values(m_Nodes);
+             auto potential = state;
+             if(term.nodalFactor != nullptr)
+             {
+-                const auto factors = term.nodalFactor->values(m_Nodes);
+-                for(size_t nodeIdx = 0u; nodeIdx < numOfQuadrilateralNodes; ++nodeIdx)
++                const auto factor = term.nodalFactor->values(m_Nodes);
++                for(std::size_t node = 0; node < potential.size(); ++node)
+                 {
+-                    potential[nodeIdx] *= factors[nodeIdx];
++                    potential[node] *= factor[node];
+                 }
+             }
+             const auto gradients = gradientsAtGaussPoints(potential);
+-            const auto conductivityValues = term.coefficient->values(m_Nodes);
+-            assert(conductivityValues.size() == numOfQuadrilateralNodes);
+-
+-            // Extrapolate flux from 2x2 Gauss points to corner nodes using the
+-            // standard bilinear extrapolation matrix.  Coefficients derive from
+-            // evaluating the Gauss-point shape functions at the corner nodes:
+-            //   A = 1 + sqrt(3)/2,  B = -1/2,  C = 1 - sqrt(3)/2
+-            constexpr auto gaussToNodeA = 1.866025404;
+-            constexpr auto gaussToNodeB = -0.5;
+-            constexpr auto gaussToNodeC = 0.133974596;
+-            const std::vector<std::vector<double>> extrapolationCoefficients{
+-              {gaussToNodeA, gaussToNodeB, gaussToNodeC, gaussToNodeB},
+-              {gaussToNodeB, gaussToNodeA, gaussToNodeB, gaussToNodeC},
+-              {gaussToNodeC, gaussToNodeB, gaussToNodeA, gaussToNodeB},
+-              {gaussToNodeB, gaussToNodeC, gaussToNodeB, gaussToNodeA}};
+-
+-            for(size_t nodeIdx = 0u; nodeIdx < numOfQuadrilateralNodes; ++nodeIdx)
++            for(std::size_t point = 0; point < count; ++point)
+             {
+-                for(const auto coeff : extrapolationCoefficients[nodeIdx])
++                const auto & psi = localElement.Psi(point);
++                double coefficient{0.0};
++                for(std::size_t node = 0; node < coefficients.size(); ++node)
+                 {
+-                    results[nodeIdx].x -= conductivityValues[nodeIdx] * gradients[nodeIdx][0] * coeff;
+-                    results[nodeIdx].y -= conductivityValues[nodeIdx] * gradients[nodeIdx][1] * coeff;
++                    coefficient += psi[node] * coefficients[node];
+                 }
++                result[point].x -= coefficient * gradients[point][0];
++                result[point].y -= coefficient * gradients[point][1];
+             }
+         }
+-        return results;
+-    }
+-
+-    std::vector<NodeFlux> IElementLinear2D::fluxAtGaussPoints() const
+-    {
+-        const auto gradients = stateGradientsAtGaussPoints();
+-        const auto cond = meanConductivity();
+-        std::vector<NodeFlux> result;
+-        result.reserve(gradients.size());
+-        for(const auto & grad : gradients)
+-        {
+-            result.emplace_back(-cond * grad[0], -cond * grad[1]);
+-        }
+         return result;
+     }
+ 
+-- 
+2.55.0.windows.2
+

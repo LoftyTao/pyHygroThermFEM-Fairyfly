@@ -1,0 +1,39 @@
+{
+  "contract_version": 1000,
+  "contract_major": 1,
+  "contract_minor": 0,
+  "contract_version_note": "Minimum contract version for the baseline issuance of each fixture. slab.thmz is a valid contract 1.0 steady-state baseline and remains readable under 2.1 (current_contract_version 2001). Contract 2.0 added optional THERM result layouts and strict active-boundary validation; 2.1 added HeatFluxStepExchange.csv and WaterFluxStepExchange.csv.",
+  "current_contract_version": 2001,
+  "files": [
+    {
+      "name": "slab.thmz",
+      "sha256": "e63f8b73e614a3c15506de0e418c7a765cffc63b00a066e70104737a19872a18",
+      "description": "Single-material analytic slab: 2000x1000 mm rectangle, k=1.0 W/(m.K), convection h=10 W/(m2.K) at 20 C (left) and 0 C (right), adiabatic top/bottom; premeshed 4 Q4 / 9 nodes.",
+      "origin": "Generated as an analytic contract 1.0 slab baseline via fairyfly-next-therm model_to_thmz and libraryfemtherm mesh serialization.",
+      "expected": {
+        "temperatures_celsius": [19.09090909090909, 10.0, 0.9090909090909091],
+        "x_flux_w_per_m2": 9.09090909090909,
+        "y_flux_w_per_m2": 0.0
+      },
+      "notes": "temperature/flux values repeat per node row (3 columns x 3 rows); checked with abs 1e-6, rel 1e-8."
+    },
+    {
+      "name": "transient-native-2.1.thmz",
+      "sha256": "588caf0f3269137636ec4b416a12f84055af41a9c5d430d9cdecebdeaa23ee38",
+      "contract_version": 2001,
+      "result_layout": "native",
+      "origin": "Transient native contract 2.1 baseline produced by fairyfly-next-therm and solved by the isolated HygroThermFEM wrapper over THMZ.",
+      "source_commit": "bbfbad7a2a1e86281a08996de0235cab69a36ac1",
+      "kernel_commit": "f3557a6ea67cfefd1912bfe703595577cca49be2",
+      "expected": {
+        "transient_result_member_count": 10,
+        "time_step_seconds": 60,
+        "number_of_timesteps": 4,
+        "frame_count_including_initial": 5,
+        "step_exchange_initial_values": 0
+      },
+      "verification": "Contract 2.1 archive/member structure and handoff baseline verified against fairyfly-next-therm.",
+      "notes": "Archive/member structure and handoff baseline only; no THERM release-archive registration, physical-equivalence claim, or full step-exchange physics acceptance. The root contract_version remains the original slab's 1000 issuance version; current_contract_version identifies 2001."
+    }
+  ]
+}

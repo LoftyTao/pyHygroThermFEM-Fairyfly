@@ -1,0 +1,1420 @@
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <ostream>
+
+#include "lbnl/algorithm.hxx"
+#include "Domain.hxx"
+#include "LinearSolver.hxx"
+#include "Common.hxx"
+#include "FEMMath.hxx"
+#include "BoundaryCondition2D.hxx"
+#include "VectorOperators.hxx"
+#include "Nodes.hxx"
+#include "Materials.hxx"
+
+namespace HygroThermFEM
+{
+    void IDomain::AdaptiveDamping::update(const double rawDuNorm,
+                                          const size_t iteration,
+                                          const size_t minIteration)
+    {
+        constexpr double growthThreshold = 1000.0;
+        constexpr double minDamping = 1.0 / 16.0;
+        constexpr size_t requiredConsecutive = 2;
+
+        if(iteration >= minIteration && rawDuNorm > growthThreshold * prevDuNorm)
+        {
+            ++consecutiveGrowth;
+            if(consecutiveGrowth >= requiredConsecutive)
+            {
+                factor = std::max(factor * 0.5, minDamping);
+            }
+        }
+        else
+        {
+            consecutiveGrowth = 0;
+            if(factor < 1.0)
+            {
+                factor = std::min(factor * 2.0, 1.0);
+            }
+        }
+        prevDuNorm = rawDuNorm;
+    }
+}   // namespace HygroThermFEM
+
+namespace
+{
+    //! Detects NR 2-cycle oscillation by checking if the convergence metric
+    //! stagnates (changes by less than 1% between consecutive iterations).
+    //! If detected, averages the last two iterates to break the cycle.
+    //! Returns true if oscillation was resolved.
+    bool resolveOscillation(std::vector<double> & solution,
+                            const std::vector<double> & prevIterSolution,
+                            const double metric,
+                            const double prevMetric,
+                            const size_t iteration,
+                            const size_t minIterations)
+    {
+        constexpr double stagnationThreshold = 0.01;
+        if(iteration < minIterations)
+        {
+            return false;
+        }
+        if(std::abs(metric - prevMetric) / (prevMetric + 1e-12) >= stagnationThreshold)
+        {
+            return false;
+        }
+
+        std::ranges::transform(solution, prevIterSolution, solution.begin(),
+            [](const double cur, const double prev) { return 0.5 * (cur + prev); });
+        return true;
+    }
+
+    //! Prints CSV header for NR iteration diagnostics.
+    void printNRHeader(std::ostream & out, const size_t numDOFs)
+    {
+        out << "subtimestep_dt,nr_iter,metric,converge_tol,correction_norm,"
+               "damping_factor,free_residual,converged,reason";
+        for(size_t dof = 0; dof < numDOFs; ++dof)
+        {
+            out << ",u" << dof;
+        }
+        out << '\n';
+    }
+
+    //! Returns the maximum absolute value in a vector. Used by the per-component
+    //! convergence check in transientTimestep, which requires the largest |dU_i|
+    //! to be small relative to the largest |U_i|. The norm-difference metric on
+    //! its own has a null space (mean-preserving perturbations leave the L2 norm
+    //! unchanged) and can falsely report convergence; this per-component check
+    //! closes that hole.
+    double maxAbs(const std::vector<double> & vec)
+    {
+        double mxv = 0.0;
+        for(const auto val : vec)
+        {
+            const double absVal = std::abs(val);
+            if(absVal > mxv)
+            {
+                mxv = absVal;
+            }
+        }
+        return mxv;
+    }
+
+    //! Computes the combined convergence metric: the stricter of the
+    //! norm-based stagnation metric and the per-component metric.
+    double convergenceMetric(const double previousNorm,
+                             const double currentNorm,
+                             const std::vector<double> & correctionDU,
+                             const double effectiveRelax,
+                             const std::vector<double> & solution)
+    {
+        const auto normMetric =
+          std::abs(previousNorm - currentNorm) / (currentNorm + 1e-12);
+        const auto componentMetric =
+          (maxAbs(correctionDU) * std::abs(effectiveRelax)) / (maxAbs(solution) + 1e-12);
+        return std::max(normMetric, componentMetric);
+    }
+
+    enum class ConvergeReason { none, metric, oscillation };
+
+    const char * reasonLabel(const ConvergeReason reason)
+    {
+        switch(reason)
+        {
+            case ConvergeReason::metric: return "metric";
+            case ConvergeReason::oscillation: return "oscillation";
+            default: return "";
+        }
+    }
+
+    struct ConvergenceResult
+    {
+        double metric;
+        ConvergeReason reason = ConvergeReason::none;
+
+        [[nodiscard]] bool converged() const
+        {
+            return reason != ConvergeReason::none;
+        }
+    };
+
+    // Residual-reduction convergence parameters (D3, moisture). A solve is converged once the
+    // free-DOF residual has dropped to reductionFactor * (its value at the initial guess). Being
+    // relative to each problem's own initial residual, this is settings- and scale-independent.
+    // The absolute floor handles the case where the initial guess already (nearly) solves the
+    // system, so the reduction target would otherwise be unreachably tiny.
+    constexpr double residualReductionFactor = 1e-6;
+    constexpr double residualAbsoluteFloor = 1e-12;
+
+    ConvergenceResult evaluateConvergence(
+      std::vector<double> & solution,
+      const std::vector<double> & prevIterSolution,
+      const std::vector<double> & correctionDU,
+      const double effectiveRelax,
+      const double previousNorm,
+      const double currentNorm,
+      const double prevMetric,
+      const double convergenceError,
+      const bool useResidual,
+      const double currentFreeResidual,
+      const double residualTarget,
+      const bool residualAtRoundOff,
+      const size_t numOfIterations,
+      const size_t minIterationsForOscillationCheck)
+    {
+        const auto metric = convergenceMetric(
+          previousNorm, currentNorm, correctionDU, effectiveRelax, solution);
+
+        // Thermal keeps the historical change-metric criterion; moisture converges when the
+        // free-DOF residual is below its target (see IDomain::residualTarget), or when every
+        // row of it is already at the rounding of its own terms and no iteration can lower it
+        // (see IDomain::freeResidualAtRoundOff).
+        const bool primaryConverged =
+          useResidual ? (currentFreeResidual <= residualTarget || residualAtRoundOff)
+                      : (metric <= convergenceError);
+
+        if(primaryConverged)
+        {
+            return {metric, ConvergeReason::metric};
+        }
+
+        // The oscillation-averaging early exit is a crutch for the change-metric: it declares
+        // convergence at a stagnated 2-cycle midpoint. Under residual-reduction convergence
+        // (moisture) that would accept a not-yet-solved, mass-leaking iterate before the
+        // residual is driven down, so it is disabled there -- the loop instead runs to the
+        // reduction target or to best-effort acceptance of the lowest-residual iterate.
+        if(!useResidual
+           && resolveOscillation(solution, prevIterSolution, metric, prevMetric,
+                                 numOfIterations, minIterationsForOscillationCheck))
+        {
+            return {metric, ConvergeReason::oscillation};
+        }
+
+        return {metric};
+    }
+
+    //! Prints one CSV row for an NR iteration.
+    void printNRRow(std::ostream & out,
+                    const double subDt,
+                    const size_t iteration,
+                    const double metric,
+                    const double convergeTol,
+                    const double correctionNorm,
+                    const double dampingFactor,
+                    const double freeResidual,
+                    const bool converged,
+                    const char * reason,
+                    const std::vector<double> & solution)
+    {
+        out << std::scientific << std::setprecision(8)
+            << subDt << ','
+            << iteration << ','
+            << metric << ','
+            << convergeTol << ','
+            << correctionNorm << ','
+            << std::fixed << std::setprecision(6)
+            << dampingFactor << ','
+            << std::scientific << std::setprecision(8)
+            << freeResidual << ','
+            << converged << ','
+            << reason;
+        out << std::scientific << std::setprecision(8);
+        for(const auto val : solution)
+        {
+            out << ',' << val;
+        }
+        out << '\n';
+    }
+}   // anonymous namespace
+
+namespace HygroThermFEM
+{
+    SquareMatrix IDomain::steadyStateLeftHandSide()
+    {
+        const auto maxNodeIndex = m_NodePool.maxIndex();
+        auto condMat = m_Elements.conductanceMatrix(maxNodeIndex);
+        const auto boundaryHMatrix = m_BCs.HMatrix(maxNodeIndex);
+        condMat += boundaryHMatrix;
+
+        return condMat;
+    }
+
+    std::vector<double> IDomain::steadyStateRightHandSide() const
+    {
+        auto vecR = m_BCs.RVector(m_NodePool.maxIndex());
+        vecR += m_Elements.volumetricSourceVector(m_NodePool.maxIndex());
+        return vecR;
+    }
+
+    IDomain::TransientSystem
+      IDomain::transientSystem(const std::vector<double> & t_PreviousSolution,
+                               const double t_DTime,
+                               const size_t timestepIndex)
+    {
+        const auto maxNodeIndex = m_NodePool.maxIndex();
+
+        auto M_K_H = m_Elements.conductanceMatrix(maxNodeIndex);
+        M_K_H += m_BCs.HMatrix(maxNodeIndex, timestepIndex);
+
+        auto vecR = m_BCs.RVector(maxNodeIndex, timestepIndex);
+        vecR += m_Elements.RVector(maxNodeIndex);
+        vecR += m_Elements.volumetricSourceVector(maxNodeIndex);
+
+        // At steadyStateStep the storage terms are absent, not merely small: the steady
+        // system carries no capacity at all, so none is assembled.
+        if(!std::isinf(t_DTime))
+        {
+            const auto MassVec = m_Elements.getLumpedMass(maxNodeIndex, t_DTime);
+            M_K_H.addToDiagonal(MassVec);
+            vecR += t_PreviousSolution * MassVec;
+        }
+        else if(!m_SealedRegions.empty())
+        {
+            return withStoredAmountRows(M_K_H, std::move(vecR));
+        }
+
+        return {std::move(M_K_H), std::move(vecR)};
+    }
+
+    bool IDomain::holdsSealedRegions(const double dTime) const
+    {
+        return std::isinf(dTime) && !m_SealedRegions.empty();
+    }
+
+    IDomain::TransientSystem IDomain::withStoredAmountRows(const SquareMatrix & matrix,
+                                                           std::vector<double> rhs) const
+    {
+        // Capacity over a unit step: the lumped secant capacity itself.
+        constexpr double unitStep{1.0};
+        const auto size = matrix.size();
+        const auto capacity = m_Elements.getLumpedMass(size, unitStep);
+        const auto & sparse = matrix.getSparseMatrix();
+
+        std::vector<Eigen::Triplet<double>> triplets;
+        triplets.reserve(static_cast<std::size_t>(sparse.nonZeros()) + size);
+        for(int outer = 0; outer < sparse.outerSize(); ++outer)
+        {
+            for(Eigen::SparseMatrix<double>::InnerIterator entry(sparse, outer); entry; ++entry)
+            {
+                const auto row = static_cast<std::size_t>(entry.row());
+                if(m_AnchorOfDof[row] != row)
+                {
+                    triplets.emplace_back(entry.row(), entry.col(), entry.value());
+                }
+            }
+        }
+        for(const auto & region : m_SealedRegions)
+        {
+            // Every degree of freedom of the region gets an entry, a zero capacity included:
+            // the pattern must not depend on the state.
+            double startAmount{0.0};
+            for(const auto dof : region.dofs)
+            {
+                const double weight{region.rowScale * capacity[dof]};
+                triplets.emplace_back(static_cast<int>(region.anchor), static_cast<int>(dof), weight);
+                startAmount += weight * m_SealedStart[dof];
+            }
+            rhs[region.anchor] = startAmount;
+        }
+        return {SquareMatrix(size, triplets), std::move(rhs)};
+    }
+
+    std::vector<std::vector<double>> IDomain::transientMultiStep(const Variable variable,
+                                                                  const double dTime,
+                                                                  const size_t numSteps)
+    {
+        auto values = m_NodePool.properties(variable);
+        std::vector<std::vector<double>> results;
+
+        for(size_t step = 0; step < numSteps; ++step)
+        {
+            const auto stepResult = transient(values, dTime);
+            if(!stepResult.has_value())
+            {
+                throw std::runtime_error("Solution failed to converge.");
+            }
+            values = stepResult.value().solution;
+            results.push_back(values);
+        }
+
+        return results;
+    }
+
+    std::optional<std::pair<double, double>> IDomain::solutionBounds() const
+    {
+        return std::nullopt;
+    }
+
+    namespace
+    {
+        enum class PinState : char
+        {
+            none,
+            lower,
+            upper
+        };
+
+        //! Pins degrees of freedom that violate the bounds; returns true when any new pin was
+        //! added.
+        bool pinViolators(const std::vector<double> & solution,
+                          const std::pair<double, double> & bounds,
+                          std::vector<PinState> & pins)
+        {
+            const auto & [lowerBound, upperBound] = bounds;
+            bool changed{false};
+            for(std::size_t index = 0u; index < solution.size(); ++index)
+            {
+                if(pins[index] != PinState::none)
+                {
+                    continue;
+                }
+                if(solution[index] > upperBound)
+                {
+                    pins[index] = PinState::upper;
+                    changed = true;
+                }
+                else if(solution[index] < lowerBound)
+                {
+                    pins[index] = PinState::lower;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        //! Releases pinned degrees of freedom whose own (unpenalized) equation pulls them back
+        //! inside the bounds -- without this the first Glaser-style supersaturated solve
+        //! over-pins whole regions that belong strictly below saturation. Returns true when any
+        //! pin was released.
+        bool releaseInactivePins(const SquareMatrix & lhsMatrix,
+                                 const std::vector<double> & rhsVector,
+                                 const std::vector<double> & solution,
+                                 const std::pair<double, double> & bounds,
+                                 std::vector<PinState> & pins)
+        {
+            // Margin against add/release chattering right at the bound.
+            constexpr double releaseMargin{1e-9};
+            const auto & [lowerBound, upperBound] = bounds;
+            const auto residual = rhsVector - lhsMatrix * solution;
+            bool changed{false};
+            for(std::size_t index = 0u; index < solution.size(); ++index)
+            {
+                if(pins[index] == PinState::none)
+                {
+                    continue;
+                }
+                // Where the DOF's original row equation would place it, its neighbours held
+                // fixed: u_i + r_i / A_ii.
+                const double freeValue{solution[index]
+                                       + residual[index] / lhsMatrix(index, index)};
+                const bool releaseUpper{pins[index] == PinState::upper
+                                        && freeValue < upperBound - releaseMargin};
+                const bool releaseLower{pins[index] == PinState::lower
+                                        && freeValue > lowerBound + releaseMargin};
+                if(releaseUpper || releaseLower)
+                {
+                    pins[index] = PinState::none;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        //! Original system plus a large diagonal penalty on every pinned degree of freedom --
+        //! the penalty dominates every physical conductance in the row, turning it into a
+        //! Dirichlet condition at the bound.
+        std::pair<SquareMatrix, std::vector<double>>
+          penalizedSystem(const SquareMatrix & lhsMatrix,
+                          const std::vector<double> & rhsVector,
+                          const std::pair<double, double> & bounds,
+                          const std::vector<PinState> & pins)
+        {
+            constexpr double penalty{1e12};
+            const auto & [lowerBound, upperBound] = bounds;
+            auto matrix{lhsMatrix};
+            auto rhs{rhsVector};
+            for(std::size_t index = 0u; index < pins.size(); ++index)
+            {
+                if(pins[index] == PinState::none)
+                {
+                    continue;
+                }
+                matrix(index, index) += penalty;
+                rhs[index] += penalty * (pins[index] == PinState::upper ? upperBound : lowerBound);
+            }
+            return {std::move(matrix), std::move(rhs)};
+        }
+
+        //! Solves lhsMatrix * u = rhsVector with u held inside the bounds. Primal active set
+        //! WITH release: pin bound violators, re-solve, release pins whose equations pull back
+        //! inside the bounds, repeat until the set is stable. Add-only pinning is not
+        //! equivalent: it freezes the first pass's Glaser-style supersaturated region at the
+        //! bound. The pass cap guards against chattering on degenerate systems.
+        std::vector<double> boundedSolve(CLinearSolver & solver,
+                                         const SquareMatrix & lhsMatrix,
+                                         const std::vector<double> & rhsVector,
+                                         const std::pair<double, double> & bounds)
+        {
+            auto solution = solver.solve(lhsMatrix, rhsVector);
+            std::vector<PinState> pins(solution.size(), PinState::none);
+            const std::size_t maxPasses{solution.size() + 10u};
+            for(std::size_t pass = 0u; pass < maxPasses; ++pass)
+            {
+                const bool anyPinned{pinViolators(solution, bounds, pins)};
+                const bool anyReleased{
+                  releaseInactivePins(lhsMatrix, rhsVector, solution, bounds, pins)};
+                if(!anyPinned && !anyReleased)
+                {
+                    break;
+                }
+                const auto [matrix, rhs] = penalizedSystem(lhsMatrix, rhsVector, bounds, pins);
+                solution = solver.solve(matrix, rhs);
+            }
+            return solution;
+        }
+    }   // namespace
+
+    namespace
+    {
+        //! Newton correction d from J d = residual with the projected state u + d held inside
+        //! the bounds: primal active set with release on the correction system. A pinned DOF
+        //! gets d_i = bound - u_i through a penalty row; a pin is released when its own
+        //! unpenalised row would bring the DOF back inside.
+        std::vector<double> boundedCorrection(CLinearSolver & solver,
+                                              const SquareMatrix & jacobian,
+                                              const std::vector<double> & residual,
+                                              const std::vector<double> & solution,
+                                              const std::pair<double, double> & bounds)
+        {
+            constexpr double penalty{1e12};
+            constexpr double releaseMargin{1e-9};
+            const auto & [lowerBound, upperBound] = bounds;
+            const auto size = solution.size();
+            std::vector<PinState> pins(size, PinState::none);
+            auto correction = solver.solve(jacobian, residual);
+            const std::size_t maxPasses{size + 10u};
+            for(std::size_t pass = 0u; pass < maxPasses; ++pass)
+            {
+                bool changed{false};
+                const auto rowResidual = residual - jacobian * correction;
+                for(std::size_t index = 0u; index < size; ++index)
+                {
+                    const double projected{solution[index] + correction[index]};
+                    if(pins[index] == PinState::none)
+                    {
+                        if(projected > upperBound)
+                        {
+                            pins[index] = PinState::upper;
+                            changed = true;
+                        }
+                        else if(projected < lowerBound)
+                        {
+                            pins[index] = PinState::lower;
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    const double freeProjected{projected + rowResidual[index] / jacobian(index, index)};
+                    const bool releaseUpper{pins[index] == PinState::upper && freeProjected < upperBound - releaseMargin};
+                    const bool releaseLower{pins[index] == PinState::lower && freeProjected > lowerBound + releaseMargin};
+                    if(releaseUpper || releaseLower)
+                    {
+                        pins[index] = PinState::none;
+                        changed = true;
+                    }
+                }
+                if(!changed)
+                {
+                    break;
+                }
+                auto matrix{jacobian};
+                auto rhs{residual};
+                for(std::size_t index = 0u; index < size; ++index)
+                {
+                    if(pins[index] == PinState::none)
+                    {
+                        continue;
+                    }
+                    const double target{pins[index] == PinState::upper ? upperBound : lowerBound};
+                    matrix(index, index) += penalty;
+                    rhs[index] += penalty * (target - solution[index]);
+                }
+                correction = solver.solve(matrix, rhs);
+            }
+            return correction;
+        }
+    }
+
+    void IDomain::ensureJacobianColumnGroups(const SquareMatrix & pattern, const bool held)
+    {
+        const auto & sparse = pattern.getSparseMatrix();
+        const auto nonZeros = static_cast<std::size_t>(sparse.nonZeros());
+        const auto size = pattern.size();
+        if(!m_JacobianColumnGroups.empty() && m_JacobianPatternSize == size
+           && m_JacobianPatternNonZeros == nonZeros && m_JacobianPatternHeld == held)
+        {
+            return;
+        }
+        // A stored-amount row (the anchor of a held region) is left out of the grouping.
+        const auto isStoredAmountRow = [this, held](const std::size_t row) {
+            return held && m_AnchorOfDof[row] == row;
+        };
+
+        // Rows a column touches: its pattern entries plus its own diagonal.
+        std::vector<std::vector<std::size_t>> rowsOfColumn(size);
+        for(int outer = 0; outer < sparse.outerSize(); ++outer)
+        {
+            for(Eigen::SparseMatrix<double>::InnerIterator entry(sparse, outer); entry; ++entry)
+            {
+                if(!isStoredAmountRow(static_cast<std::size_t>(entry.row())))
+                {
+                    rowsOfColumn[static_cast<std::size_t>(entry.col())].push_back(
+                      static_cast<std::size_t>(entry.row()));
+                }
+            }
+        }
+        for(std::size_t column = 0u; column < size; ++column)
+        {
+            // Each row exactly once: the triplet constructor SUMS duplicates, and a doubled
+            // diagonal halves every Newton step (found 2026-09-03 on the sealed strip).
+            if(!isStoredAmountRow(column))
+            {
+                rowsOfColumn[column].push_back(column);
+            }
+            rowsOfColumn[column] = lbnl::sorted_unique(rowsOfColumn[column]);
+        }
+
+        // Greedy grouping: a column joins the first group none of whose taken rows it touches.
+        std::vector<std::vector<std::size_t>> groups;
+        std::vector<std::vector<bool>> rowsTaken;
+        for(std::size_t column = 0u; column < size; ++column)
+        {
+            const auto & rows = rowsOfColumn[column];
+            std::size_t group{0u};
+            for(; group < groups.size(); ++group)
+            {
+                const auto & taken = rowsTaken[group];
+                if(std::ranges::none_of(rows, [&taken](const std::size_t row) { return taken[row]; }))
+                {
+                    break;
+                }
+            }
+            if(group == groups.size())
+            {
+                groups.emplace_back();
+                rowsTaken.emplace_back(size, false);
+            }
+            groups[group].push_back(column);
+            for(const auto row : rows)
+            {
+                rowsTaken[group][row] = true;
+            }
+        }
+
+        m_JacobianColumnGroups = std::move(groups);
+        m_JacobianRowsOfColumn = std::move(rowsOfColumn);
+        m_JacobianPatternSize = size;
+        m_JacobianPatternNonZeros = nonZeros;
+        m_JacobianPatternHeld = held;
+    }
+
+    SquareMatrix IDomain::finiteDifferenceJacobian(const std::vector<double> & solution,
+                                                   const SquareMatrix & matA,
+                                                   const std::vector<double> & vecB,
+                                                   const std::vector<double> & currentStateValues,
+                                                   const double dTime,
+                                                   const size_t timestepIndex,
+                                                   const std::pair<double, double> & bounds)
+    {
+        constexpr double perturbation{1e-6};
+        const bool held{holdsSealedRegions(dTime)};
+        ensureJacobianColumnGroups(matA, held);
+        const auto size = solution.size();
+        const auto baseline = matA * solution - vecB;
+
+        std::vector<Eigen::Triplet<double>> triplets;
+        triplets.reserve(m_JacobianPatternNonZeros + size);
+        for(const auto & group : m_JacobianColumnGroups)
+        {
+            auto perturbed = solution;
+            std::vector<double> steps(size, 0.0);
+            for(const auto column : group)
+            {
+                // Step away from the upper bound so the perturbed state stays physical.
+                const double step{solution[column] + perturbation > bounds.second ? -perturbation
+                                                                                   : perturbation};
+                perturbed[column] += step;
+                steps[column] = step;
+            }
+            updateNodes(perturbed, false);
+            const auto [matP, vecP] = transientSystem(currentStateValues, dTime, timestepIndex);
+            const auto shifted = matP * perturbed - vecP;
+            for(const auto column : group)
+            {
+                for(const auto row : m_JacobianRowsOfColumn[column])
+                {
+                    triplets.emplace_back(static_cast<int>(row),
+                                          static_cast<int>(column),
+                                          (shifted[row] - baseline[row]) / steps[column]);
+                }
+                if(held && m_AnchorOfDof[column] != noAnchor)
+                {
+                    // The stored-amount row is a sum of one term per column,
+                    // weight_j(u_j) (u_j - start_j), so the column's own term gives its
+                    // entry however many columns of the region the group perturbs.
+                    const auto anchor = m_AnchorOfDof[column];
+                    const double start{m_SealedStart[column]};
+                    const double before{matA(anchor, column) * (solution[column] - start)};
+                    const double after{matP(anchor, column) * (perturbed[column] - start)};
+                    triplets.emplace_back(static_cast<int>(anchor),
+                                          static_cast<int>(column),
+                                          (after - before) / steps[column]);
+                }
+            }
+        }
+        updateNodes(solution, false);
+        return SquareMatrix(size, triplets);
+    }
+
+    std::vector<double> IDomain::steadyState()
+    {
+        const auto lhsMatrix = steadyStateLeftHandSide();
+        const auto rhsVector = steadyStateRightHandSide();
+        const auto bounds{solutionBounds()};
+        if(!bounds.has_value())
+        {
+            return m_LinearSolver.solve(lhsMatrix, rhsVector);
+        }
+        return boundedSolve(m_LinearSolver, lhsMatrix, rhsVector, bounds.value());
+    }
+
+    SteadyNewtonResult IDomain::steadyNewton(const std::vector<double> & start)
+    {
+        // One Newton solve at the infinite step: the transient's iteration on the steady
+        // system. No subdivision and no shock retry, both of which need a timestep to split.
+        constexpr std::size_t steadyBoundaryStep{0u};
+        const auto result = transientTimestep(start, steadyStateStep, steadyBoundaryStep);
+        return {.solution = result.solution, .converged = result.converged};
+    }
+
+    namespace
+    {
+        //! Calls visit(row, column) for every non-zero entry of the matrix.
+        template<typename Visitor>
+        void forEachNonZero(const SquareMatrix & matrix, const Visitor & visit)
+        {
+            const auto & sparse = matrix.getSparseMatrix();
+            for(int outer = 0; outer < sparse.outerSize(); ++outer)
+            {
+                for(Eigen::SparseMatrix<double>::InnerIterator entry(sparse, outer); entry; ++entry)
+                {
+                    if(entry.value() != 0.0)
+                    {
+                        visit(static_cast<std::size_t>(entry.row()), static_cast<std::size_t>(entry.col()));
+                    }
+                }
+            }
+        }
+
+        //! Per degree of freedom, whether the matrix has a non-zero entry in its row or column.
+        std::vector<bool> touchedDofs(const SquareMatrix & matrix)
+        {
+            std::vector<bool> touched(matrix.size(), false);
+            forEachNonZero(matrix, [&touched](const std::size_t row, const std::size_t column) {
+                touched[row] = true;
+                touched[column] = true;
+            });
+            return touched;
+        }
+
+        //! Representative of a degree of freedom in a union-find forest, with path halving.
+        std::size_t rootOf(std::vector<std::size_t> & parent, std::size_t dof)
+        {
+            while(parent[dof] != dof)
+            {
+                parent[dof] = parent[parent[dof]];
+                dof = parent[dof];
+            }
+            return dof;
+        }
+
+        //! The degrees of freedom grouped by connection through the non-zero entries of the
+        //! matrix, each group in ascending order. A degree of freedom with no entry belongs to
+        //! no group.
+        std::vector<std::vector<std::size_t>> connectedRegions(const SquareMatrix & matrix)
+        {
+            const auto size = matrix.size();
+            std::vector<std::size_t> parent(size);
+            std::iota(parent.begin(), parent.end(), std::size_t{0u});
+            forEachNonZero(matrix, [&parent](const std::size_t row, const std::size_t column) {
+                parent[rootOf(parent, row)] = rootOf(parent, column);
+            });
+
+            const auto touched = touchedDofs(matrix);
+            std::map<std::size_t, std::vector<std::size_t>> byRoot;
+            for(std::size_t dof = 0u; dof < size; ++dof)
+            {
+                if(touched[dof])
+                {
+                    byRoot[rootOf(parent, dof)].push_back(dof);
+                }
+            }
+            return lbnl::transform_to_vector(byRoot, [](const auto & entry) { return entry.second; });
+        }
+
+        //! The sealed region over the given degrees of freedom: anchored at its largest
+        //! capacity, its storage row scaled to the region's conductances.
+        SealedRegion sealedRegion(std::vector<std::size_t> dofs,
+                                  const SquareMatrix & conductance,
+                                  const std::vector<double> & capacity)
+        {
+            const auto anchor = *std::ranges::max_element(
+              dofs, {}, [&capacity](const std::size_t dof) { return capacity[dof]; });
+            double capacitySum{0.0};
+            double conductanceSum{0.0};
+            for(const auto dof : dofs)
+            {
+                capacitySum += capacity[dof];
+                conductanceSum += std::abs(conductance(dof, dof));
+            }
+            return {.dofs = std::move(dofs),
+                    .anchor = anchor,
+                    .capacity = capacitySum,
+                    .rowScale = capacitySum > 0.0 ? conductanceSum / capacitySum : 0.0};
+        }
+    }   // namespace
+
+    std::vector<SealedRegion> IDomain::sealedRegions()
+    {
+        constexpr std::size_t steadyBoundaryStep{0u};
+        constexpr double unitStep{1.0};
+        const auto size = m_NodePool.maxIndex();
+        const auto conductance = m_Elements.conductanceMatrix(size);
+        const auto exchange = m_BCs.HMatrix(size, steadyBoundaryStep);
+        const auto capacity = m_Elements.getLumpedMass(size, unitStep);
+        const auto exchanging = touchedDofs(exchange);
+
+        std::vector<SealedRegion> regions;
+        for(auto & dofs : connectedRegions(conductance))
+        {
+            if(std::ranges::none_of(dofs, [&exchanging](const std::size_t dof) { return exchanging[dof]; }))
+            {
+                regions.push_back(sealedRegion(std::move(dofs), conductance, capacity));
+            }
+        }
+        return regions;
+    }
+
+    void IDomain::holdSealedRegions(const std::vector<SealedRegion> & regions,
+                                    const std::vector<double> & start)
+    {
+        m_SealedRegions = regions;
+        m_SealedStart = start;
+        m_AnchorOfDof.assign(start.size(), noAnchor);
+        for(const auto & region : regions)
+        {
+            for(const auto dof : region.dofs)
+            {
+                m_AnchorOfDof[dof] = region.anchor;
+            }
+        }
+        if(!regions.empty())
+        {
+            // Current, then previous: the secant capacity is taken against the start field.
+            updateNodes(start, false);
+            updateNodes(start, true);
+        }
+    }
+
+    void IDomain::releaseSealedRegions()
+    {
+        m_SealedRegions.clear();
+        m_SealedStart.clear();
+        m_AnchorOfDof.clear();
+    }
+
+    double IDomain::sealedStorageDrift() const
+    {
+        if(m_SealedRegions.empty())
+        {
+            return 0.0;
+        }
+        constexpr double unitStep{1.0};
+        constexpr double minimumScale{1e-300};
+        const auto capacity = m_Elements.getLumpedMass(m_NodePool.maxIndex(), unitStep);
+        const auto solution = m_NodePool.properties(stateVariable());
+        double drift{0.0};
+        for(const auto & region : m_SealedRegions)
+        {
+            double change{0.0};
+            double scale{minimumScale};
+            for(const auto dof : region.dofs)
+            {
+                change += capacity[dof] * (solution[dof] - m_SealedStart[dof]);
+                scale += capacity[dof] * (std::max)(std::abs(solution[dof]), std::abs(m_SealedStart[dof]));
+            }
+            drift = (std::max)(drift, std::abs(change) / scale);
+        }
+        return drift;
+    }
+
+    double IDomain::steadyStateResidual()
+    {
+        constexpr double minimumScale = 1e-12;
+        constexpr std::size_t steadyBoundaryStep{0u};
+        const auto solution = m_NodePool.properties(stateVariable());
+        const auto [matA, vecB] = transientSystem(solution, steadyStateStep, steadyBoundaryStep);
+        const double scale = (std::max)(norm(vecB), minimumScale);
+        return freeDofResidualNorm(solution, matA, vecB) / scale;
+    }
+
+    lbnl::ExpectedExt<SingleSolution, SolverError> IDomain::transient(
+      const std::vector<double> & currentStateValues,
+      const double t_DTime,
+      const size_t timestepIndex)
+    {
+        const auto settings = solverSettings();
+        auto currentDivisionLevel{0u};
+        const auto maxDivisionLevel{settings.maxDivisions};
+        double currentDTime{t_DTime};
+        const unsigned numberOfSubtimesteps{settings.numberOfSubtimesteps};
+
+        if(m_DiagStream != nullptr)
+        {
+            printNRHeader(*m_DiagStream, currentStateValues.size());
+        }
+
+        // The pending boundary-exchange ledger belongs to this call alone; a
+        // discarded moisture solve or a coupling probe replaces it wholesale.
+        m_PendingBoundaryExchange.clear();
+
+        // Try to solve at the requested dt. If NR fails to converge, subdivide
+        // and try again with a smaller dt. Return after the FIRST successful
+        // solve, reporting the actual dt used. The caller (MultiDomain) is
+        // responsible for accumulating time and exchanging cross-domain data.
+        bool retriedForBoundHit = false;
+        while(true)
+        {
+            notify(currentDivisionLevel, 0u);
+            auto result = transientTimestep(currentStateValues, currentDTime, timestepIndex);
+
+            if(result.converged && retryStepOnNewBoundHit() && !retriedForBoundHit
+               && hasNewBoundHits(currentStateValues, result.solution))
+            {
+                // Initial-condition/boundary shock: the accepted solution drove DOFs onto a
+                // physical bound they did not start at (overshoot clamped by postProcess).
+                // Resolve the shock in time by redoing this one step as a bounded substep
+                // chain. Single-shot: if the resolved step still ends at a bound, that is
+                // accepted as physical.
+                retriedForBoundHit = true;
+                // The single-shot solve is discarded: drop its exchange so only the
+                // shock chain's own micro-steps are booked.
+                m_PendingBoundaryExchange.clear();
+                result = resolveShockStep(currentStateValues, currentDTime, timestepIndex);
+            }
+            else if(result.converged)
+            {
+                accumulateBoundaryExchange(currentDTime, timestepIndex);
+            }
+
+            if(result.converged)
+            {
+                return SingleSolution{result.solution, currentDTime};
+            }
+
+            currentDTime = currentDTime / numberOfSubtimesteps;
+            ++currentDivisionLevel;
+            if(currentDivisionLevel > maxDivisionLevel)
+            {
+                return lbnl::Unexpected(
+                  SolverError{currentDTime, currentDivisionLevel, result.residualNorm});
+            }
+        }
+    }
+
+    bool IDomain::hasNewBoundHits(const std::vector<double> & startValues,
+                                  const std::vector<double> & solution) const
+    {
+        const auto startConstrained = constrainedDofs(startValues);
+        const auto solutionConstrained = constrainedDofs(solution);
+        for(std::size_t idx = 0; idx < solution.size(); ++idx)
+        {
+            if(solutionConstrained[idx] && !startConstrained[idx])
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    IDomain::TimestepResult IDomain::resolveShockStep(const std::vector<double> & startValues,
+                                                      const double t_DTime,
+                                                      const size_t timestepIndex)
+    {
+        constexpr unsigned shockSubsteps = 8;
+        const auto entryPreviousValues =
+          m_NodePool.properties(stateVariable(), Timestep::Previous);
+        const double subDTime = t_DTime / shockSubsteps;
+
+        auto values = startValues;
+        TimestepResult result{.solution = startValues, .converged = true};
+        for(unsigned substep = 0; substep < shockSubsteps; ++substep)
+        {
+            // Make the nodes' previous-timestep value the substep start, so the secant
+            // storage capacity telescopes (conserves) per substep. Double update: the
+            // first call sets the current value, the second rolls it into previous.
+            updateNodes(values, false);
+            updateNodes(values, true);
+            result = transientTimestep(values, subDTime, timestepIndex);
+            if(!result.converged)
+            {
+                break;
+            }
+            // Each accepted shock micro-step is real marching time; book its
+            // boundary exchange at its own sub-DTime.
+            accumulateBoundaryExchange(subDTime, timestepIndex);
+            values = result.solution;
+        }
+
+        // Restore the previous-timestep values owned by the caller (coupling repeats rely
+        // on previous == step start), then re-impose the final solution as current.
+        updateNodes(entryPreviousValues, false);
+        updateNodes(entryPreviousValues, true);
+        updateNodes(result.solution, m_AutomaticUpdatePreviousTimestep);
+        return result;
+    }
+
+    IDomain::LineSearchResult IDomain::backtrackingLineSearch(
+      const std::vector<double> & currentSolution,
+      const std::vector<double> & correctionDU,
+      const double initialRelax,
+      const double currentResidualNorm,
+      const std::vector<double> & currentStateValues,
+      const double dTime,
+      const size_t timestepIndex)
+    {
+        constexpr int maxAttempts = 8;
+        constexpr double shrinkFactor = 0.5;
+        double effectiveRelax = initialRelax;
+
+        for(int attempt = 0; attempt < maxAttempts; ++attempt)
+        {
+            auto trialSolution = currentSolution + correctionDU * effectiveRelax;
+            postProcess(trialSolution);
+
+            updateNodes(trialSolution, m_AutomaticUpdatePreviousTimestep);
+            auto [matA, vecB] = transientSystem(currentStateValues, dTime, timestepIndex);
+
+            const double trialResidualNorm = freeDofResidualNorm(trialSolution, matA, vecB);
+
+            if(trialResidualNorm < currentResidualNorm || attempt == maxAttempts - 1)
+            {
+                return {std::move(trialSolution), std::move(matA),
+                        std::move(vecB), effectiveRelax};
+            }
+            effectiveRelax *= shrinkFactor;
+        }
+
+#if defined(_MSC_VER)
+        __assume(false);
+#elif defined(__GNUC__) || defined(__clang__)
+        __builtin_unreachable();
+#endif
+    }
+
+    double IDomain::freeDofResidualNorm(const std::vector<double> & solution,
+                                        const SquareMatrix & matA,
+                                        const std::vector<double> & vecB) const
+    {
+        const auto residual = vecB - matA * solution;
+        const auto constrained = constrainedDofs(solution);
+        double sumSq = 0.0;
+        for(std::size_t i = 0; i < residual.size(); ++i)
+        {
+            if(!constrained[i])
+            {
+                sumSq += residual[i] * residual[i];
+            }
+        }
+        return std::sqrt(sumSq);
+    }
+
+    bool IDomain::freeResidualAtRoundOff(const std::vector<double> & solution,
+                                         const SquareMatrix & matA,
+                                         const std::vector<double> & vecB) const
+    {
+        // A row's residual b_i - sum_j A_ij u_j is computed from terms of size
+        // |b_i| + sum_j |A_ij| |u_j|, and u itself is resolved to its last bit, so the row
+        // cannot be brought below a few rounding units of that size.
+        constexpr double roundingUnits{16.0};
+        constexpr double bound{roundingUnits * std::numeric_limits<double>::epsilon()};
+        const auto residual = vecB - matA * solution;
+        const auto magnitude = lbnl::transform_to_vector(
+          solution, [](const double value) { return std::abs(value); });
+        const auto termSize = matA.absolute() * magnitude;
+        const auto constrained = constrainedDofs(solution);
+        for(std::size_t row = 0u; row < residual.size(); ++row)
+        {
+            if(!constrained[row] && std::abs(residual[row]) > bound * (termSize[row] + std::abs(vecB[row])))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void IDomain::performNRIteration(NRLoopState & state,
+                                      const std::vector<double> & currentStateValues,
+                                      const double relaxParameter,
+                                      const double convergenceError,
+                                      const size_t maxIterations,
+                                      const double dTime,
+                                      const size_t timestepIndex)
+    {
+        constexpr size_t minIterationsForOscillationCheck = 4;
+        const double previousNorm = state.currentNorm;
+        const auto prevIterSolution = state.solution;
+
+        // Bounded domains (moisture) take a true Newton direction, J d = residual with the
+        // exact Jacobian, and the physical bounds enter the correction system itself:
+        // violators are pinned at the bound and the free nodes re-solved against them. A
+        // correction solved without the pins asks the saturated nodes for Glaser-style
+        // supersaturation; once the clamp truncates those components the free nodes'
+        // corrections solve nothing and the iteration creeps by a fixed amount per step,
+        // independent of the timestep, until the budget runs out (2026-09-03,
+        // stucco/fiberglass wall). Unbounded domains (thermal) keep the historical
+        // lagged-coefficient correction, byte-identical.
+        const auto residual = state.vecB - state.matA * state.solution;
+        const auto bounds = solutionBounds();
+        auto correctionDU = m_LinearSolver.solve(state.matA, residual);
+        if(bounds.has_value())
+        {
+            const auto jacobian = finiteDifferenceJacobian(
+              state.solution, state.matA, state.vecB, currentStateValues, dTime, timestepIndex, bounds.value());
+            correctionDU =
+              boundedCorrection(m_LinearSolver, jacobian, residual, state.solution, bounds.value());
+        }
+        const double rawDuNorm = norm(correctionDU);
+
+        if(limitIncrement(state.solution, correctionDU, relaxParameter))
+        {
+            ++state.numOfIterations;
+            state.convergedViaClamp = true;
+            state.converged = true;
+            return;
+        }
+
+        // Thermal uses the historical dU-growth damping. Moisture instead adapts damping from
+        // the residual trend (below), so its damping factor -- already updated at the end of the
+        // previous iteration -- is left as-is here.
+        if(!useResidualConvergence())
+        {
+            state.damping.update(rawDuNorm, state.numOfIterations, maxIterations / 2);
+        }
+
+        // Moisture ignores the user relaxation parameter and lets the adaptive damping fully
+        // control under-relaxation, so the solve is independent of the relaxation setting;
+        // thermal keeps the historical relaxParameter * damping behaviour.
+        const double baseRelax = useResidualConvergence() ? 1.0 : relaxParameter;
+        // Pinned rows carry an irreducible residual; the line search must judge progress on the
+        // free rows only, or that constant masks every real change (no-op for thermal, which
+        // constrains nothing).
+        auto lsResult = backtrackingLineSearch(
+          state.solution, correctionDU,
+          baseRelax * state.damping.factor,
+          freeDofResidualNorm(state.solution, state.matA, state.vecB),
+          currentStateValues, dTime, timestepIndex);
+        state.solution = std::move(lsResult.solution);
+        state.matA = std::move(lsResult.matA);
+        state.vecB = std::move(lsResult.vecB);
+
+        auto normSolution = state.solution + correctionDU;
+        postProcess(normSolution);
+        state.currentNorm = norm(normSolution);
+        ++state.numOfIterations;
+
+        // Free-DOF residual of the current iterate (matA/vecB were reassembled for it in the
+        // line search). Moisture converges when this drops to a fraction of the initial-guess
+        // residual (residual-reduction, D3); thermal ignores it.
+        const bool useResidual = useResidualConvergence();
+        const double currentFreeResidual =
+          useResidual ? freeDofResidualNorm(state.solution, state.matA, state.vecB) : 0.0;
+        const bool residualAtRoundOff{
+          useResidual && freeResidualAtRoundOff(state.solution, state.matA, state.vecB)};
+
+        // Track the lowest-residual iterate so best-effort acceptance returns the best point
+        // visited (not an oscillating last iterate) when the reduction target isn't met.
+        if(useResidual && currentFreeResidual < state.bestResidual)
+        {
+            state.bestResidual = currentFreeResidual;
+            state.bestSolution = state.solution;
+        }
+
+        // Adaptive under-relaxation (moisture): if this step increased the free residual the
+        // iteration is diverging (typical at relaxation 1.0 when wetting toward saturation, where
+        // the sorption capacity is very stiff), so halve the damping factor; if it decreased,
+        // relax the damping back toward 1. The reduced factor feeds the next iteration's line
+        // search, converting a divergent fixed-relaxation solve into a stable under-relaxed one.
+        // Start at full relaxation (damping factor 1.0, fresh each timestep) and ratchet it down
+        // when a step increases the free residual (divergence); recover it toward 1.0 when a step
+        // makes progress, so a case that only needs damping through an early stiff transient can
+        // speed back up once stable. Purely monotonic decrease converges too slowly for cases
+        // that recover.
+        if(useResidual)
+        {
+            constexpr double minDamping = 1.0 / 64.0;
+            if(currentFreeResidual > state.prevFreeResidual)
+            {
+                state.damping.factor = std::max(state.damping.factor * 0.5, minDamping);
+            }
+            else
+            {
+                state.damping.factor = std::min(state.damping.factor * 1.5, 1.0);
+            }
+            state.prevFreeResidual = currentFreeResidual;
+        }
+
+        const auto result = evaluateConvergence(
+          state.solution, prevIterSolution, correctionDU, lsResult.effectiveRelax,
+          previousNorm, state.currentNorm, state.prevMetric, convergenceError,
+          useResidual, currentFreeResidual, state.residualTarget, residualAtRoundOff,
+          state.numOfIterations, minIterationsForOscillationCheck);
+
+        if(result.reason == ConvergeReason::oscillation)
+        {
+            postProcess(state.solution);
+        }
+        state.converged = result.converged();
+        state.prevMetric = result.metric;
+
+        if(m_DiagStream != nullptr)
+        {
+            printNRRow(*m_DiagStream, dTime, state.numOfIterations, result.metric,
+                       convergenceError, rawDuNorm, state.damping.factor,
+                       currentFreeResidual, state.converged, reasonLabel(result.reason),
+                       state.solution);
+        }
+    }
+
+    IDomain::TimestepResult
+      IDomain::transientTimestep(const std::vector<double> & currentStateValues,
+                                 const double t_DTime,
+                                 const size_t timestepIndex)
+    {
+        const auto settings = solverSettings();
+        const auto relaxParameter = settings.relaxationParameter;
+        const auto convergenceError = settings.errorTolerance;
+        auto maxIterations = settings.maxNumberOfIterations;
+
+        // With the latent heat of fusion active the thermal domain converges on residual
+        // reduction (see ThermalDomain::useResidualConvergence): the secant capacity kink
+        // contracts the fixed point slowly, so the iteration needs room to drive the
+        // residual down before best-effort acceptance -- the user's usual budget (~25)
+        // was tuned for the fast change-metric exits.
+        if(useResidualConvergence() && !physicsOptions().excludeLatentHeatOfFusion)
+        {
+            maxIterations = (std::max)(maxIterations, static_cast<std::size_t>(200));
+        }
+
+        auto [matA, vecB] = transientSystem(currentStateValues, t_DTime, timestepIndex);
+
+        if(isLinear())
+        {
+            auto solution = m_LinearSolver.solve(matA, vecB);
+            postProcess(solution);
+            m_LastSolveAtPhysicalBound = false;
+            updateNodes(solution, m_AutomaticUpdatePreviousTimestep);
+            return {solution, true, 0.0};
+        }
+
+        // The residual-reduction convergence target (D3, moisture only).
+        const double target =
+          useResidualConvergence() ? residualTarget(currentStateValues, matA, vecB) : 0.0;
+
+        NRLoopState state{
+          .solution = currentStateValues,
+          .matA = std::move(matA),
+          .vecB = std::move(vecB),
+          .currentNorm = norm(currentStateValues),
+          .residualTarget = target,
+          .damping = {}};
+
+        while(state.numOfIterations <= maxIterations && !state.converged)
+        {
+            performNRIteration(state, currentStateValues, relaxParameter,
+                               convergenceError, maxIterations, t_DTime, timestepIndex);
+        }
+
+        // Best-effort acceptance for residual-reduction domains (moisture): if the iteration
+        // budget is exhausted without meeting the reduction target, return the best (lowest
+        // free-residual) iterate seen and accept it, rather than reporting non-convergence
+        // (which would drive subdivision to a throw) or returning an oscillating last iterate.
+        // The established behaviour here is to run the iterations and return; the
+        // reduction criterion still governs early exit and accuracy for the converging cases.
+        if(useResidualConvergence())
+        {
+            if(!state.converged && !state.bestSolution.empty())
+            {
+                state.solution = state.bestSolution;
+            }
+            state.converged = true;
+        }
+
+        m_LastSolveAtPhysicalBound = state.convergedViaClamp;
+        updateNodes(state.solution, m_AutomaticUpdatePreviousTimestep);
+
+        const auto residualNorm = norm(state.vecB - state.matA * state.solution);
+        return {state.solution, state.converged, residualNorm};
+    }
+
+    bool IDomain::isLinear() const
+    {
+        return m_BCs.isLinear() && m_Elements.isLinear();
+    }
+
+    double IDomain::residualTarget(const std::vector<double> & currentStateValues,
+                                   const SquareMatrix & matA,
+                                   const std::vector<double> & vecB)
+    {
+        // The reduction of the initial guess's residual over the free DOFs: relative to each
+        // problem's own scale, with a floor for a guess that already (nearly) solves the system.
+        const double initialFreeResidual = freeDofResidualNorm(currentStateValues, matA, vecB);
+        return residualReductionFactor * initialFreeResidual + residualAbsoluteFloor;
+    }
+
+    void IDomain::setSolverSettings(const SolverSettings & settings)
+    {
+        m_SolverSettings = settings;
+    }
+
+    SolverSettings IDomain::solverSettings() const
+    {
+        return m_SolverSettings ? *m_SolverSettings : SolverSettings::fromGlobals();
+    }
+
+    void IDomain::setPhysicsOptions(const PhysicsOptions & options)
+    {
+        m_PhysicsOptions = options;
+    }
+
+    PhysicsOptions IDomain::physicsOptions() const
+    {
+        return m_PhysicsOptions ? *m_PhysicsOptions : PhysicsOptions::fromGlobals();
+    }
+
+    IDomain::IDomain(Nodes & nodePool,
+                     Materials & materialPool,
+                     const bool automaticUpdateOfPreviousTimestep) :
+        m_NodePool(nodePool),
+        m_MaterialPool(materialPool),
+        m_AutomaticUpdatePreviousTimestep(automaticUpdateOfPreviousTimestep)
+    {}
+
+    std::vector<NodeFlux> IDomain::flux() const
+    {
+        return m_Elements.flux(m_NodePool.maxIndex());
+    }
+
+    std::vector<BoundaryHeatRate> IDomain::boundaryHeatRates(
+      const Variable variable, const size_t timestepIndex) const
+    {
+        return m_BCs.heatRates(variable, timestepIndex);
+    }
+
+    void IDomain::accumulateBoundaryExchange(const double dTime,
+                                             const size_t timestepIndex)
+    {
+        for(const auto & rate : boundaryHeatRates(stateVariable(), timestepIndex))
+        {
+            m_PendingBoundaryExchange[{rate.node1, rate.node2}] +=
+              rate.heatRate * dTime;
+        }
+    }
+
+    const ElementsLinear2D & IDomain::elements() const
+    {
+        return m_Elements;
+    }
+
+    void IDomain::setVolumetricSource(const double value)
+    {
+        m_Elements.setVolumetricSource(value);
+    }
+
+    void IDomain::setVolumetricSource(const std::vector<double> & perElement)
+    {
+        m_Elements.setVolumetricSource(perElement);
+    }
+
+    bool IDomain::lastSolveAtPhysicalBound() const
+    {
+        return m_LastSolveAtPhysicalBound;
+    }
+
+    bool IDomain::limitIncrement(const std::vector<double> & /*currentSolution*/,
+                                 std::vector<double> & /*increment*/,
+                                 const double /*relaxParameter*/) const
+    {
+        // Default: no limiting. Derived classes override for physical bounds.
+        return false;
+    }
+
+    void IDomain::postProcess(std::vector<double> &)
+    {
+        updateGasCavities();
+    }
+
+    void IDomain::updateGasCavities()
+    {
+        if(!gasCavities)
+        {
+            gasCavities.emplace(m_NodePool, m_MaterialPool, m_Elements, m_CavitySurfaceEmissivities);
+            gasCavities->setGravityVector(m_GravityVector);
+        }
+        gasCavities->update();
+    }
+
+    std::vector<GasCavityState> IDomain::gasCavityStates() const
+    {
+        return gasCavities ? gasCavities->states() : std::vector<GasCavityState>{};
+    }
+
+    void IDomain::setCavitySurfaceEmissivity(const std::size_t node1,
+                                             const std::size_t node2,
+                                             const double emissivity)
+    {
+        m_CavitySurfaceEmissivities[cavitySegmentKey(node1, node2)] = emissivity;
+        gasCavities.reset();
+    }
+
+    void IDomain::setGravityVector(const FenestrationCommon::GravityVector & gravityVector)
+    {
+        m_GravityVector = gravityVector;
+        if(gasCavities)
+        {
+            gasCavities->setGravityVector(gravityVector);
+        }
+    }
+
+    void IDomain::setDiagnosticStream(std::ostream * stream)
+    {
+        m_DiagStream = stream;
+    }
+
+    void IDomain::clearModel()
+    {
+        m_NodePool.clear();
+        m_MaterialPool.clear();
+        m_BCs.clear();
+        m_Elements.clearElements();
+        m_CavitySurfaceEmissivities.clear();
+    }
+
+}   // namespace HygroThermFEM

@@ -1,0 +1,38 @@
+#pragma once
+
+// Back-compat umbrella: exposes the full historical surface so existing consumers that
+// include <HygroThermFEM2D.hxx> keep building unchanged. New code should prefer the
+// curated facades under HygroThermFEM/ (Engine.hxx, Results.hxx, ...). This header is
+// transitional and will be removed once consumers migrate to the facades.
+#include "../src/mesh/Node2D.hxx"
+#include "../src/mesh/Point.hxx"
+#include "../src/simulation/State.hxx"
+#include "../src/materials/Material.hxx"
+#include "../src/elements/Element2D.hxx"
+#include "../src/elements/Elements2D.hxx"
+#include "../src/elements/QuadrilateralLocal2D.hxx"
+#include "../src/elements/Quadrilateral2D.hxx"
+#include "../src/mesh/IntegrationPoints.hxx"
+#include "../src/boundary/IBCLine2D.hxx"
+#include "../src/elements/LineLocal1D.hxx"
+#include "../src/mesh/Nodes.hxx"
+#include "../src/boundary/BoundaryCondition2D.hxx"
+#include "../src/boundary/BoundaryCondition2DThermal.hxx"
+#include "../src/boundary/BoundaryCondition2DMoisture.hxx"
+#include "../src/boundary/BoundaryConditions2D.hxx"
+#include "../src/math/SquareMatrix.hxx"
+#include "../src/math/VectorOperators.hxx"
+#include "../src/math/LinearSolver.hxx"
+#include "../src/domain/Domain.hxx"
+#include "../src/math/Functions.hxx"
+#include "../src/mesh/Interpolator.hxx"
+#include "../src/materials/Materials.hxx"
+#include "../src/materials/MaterialTableConsistency.hxx"
+#include "../src/math/FEMMath.hxx"
+#include "../src/domain/MultiDomain.hxx"
+#include "../src/common/Common.hxx"
+#include "../src/materials/GasCavities.hxx"
+#include "../src/simulation/SimulationProperties.hxx"
+#include "../src/boundary/BoundaryConditionCoefficients.hxx"
+#include "../src/simulation/TimestepObserver.hxx"
+#include "../src/boundary/ConvectiveCoefficient.hxx"

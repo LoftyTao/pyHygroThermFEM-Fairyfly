@@ -1,0 +1,603 @@
+#pragma once
+
+#include <iosfwd>
+#include <map>
+#include <optional>
+#include <utility>
+
+#include "Domain.hxx"
+#include "ThermalDomain.hxx"
+#include "MoistureDomain.hxx"
+#include "MaterialMissingProperties.hxx"
+#include "Materials.hxx"
+#include "Nodes.hxx"
+
+namespace Timesteps
+{
+    class TimestepObserver;
+}
+
+namespace HygroThermFEM
+{
+    //! \brief Parameters for creating a MultiDomain with designated initializers (C++20)
+    struct MultiDomainParams
+    {
+        bool performThermal = true;
+        bool performMoisture = true;
+    };
+
+    //! \brief Parameters for creating an element with designated initializers (C++20)
+    struct ElementParams
+    {
+        size_t node1 = 0;
+        size_t node2 = 0;
+        size_t node3 = 0;
+        size_t node4 = 0;
+        std::string material;
+    };
+
+    //! \brief Keeps solution from current timestep for every node in the domain.
+    struct Solution
+    {
+        Solution(double dtime,
+                 std::vector<double> temperature,
+                 std::vector<double> humidity,
+                 std::vector<double> waterContent,
+                 std::vector<double> liquidWaterContent,
+                 std::vector<double> vaporContent,
+                 std::vector<double> iceContent,
+                 std::vector<NodeFlux> heatFlux,
+                 std::vector<NodeFlux> waterFlux,
+                 double temperatureError,
+                 double humidityError);
+
+        double dTime;
+        std::vector<double> temperature;
+        std::vector<double> humidity;
+        std::vector<double> waterContent;
+        std::vector<double> liquidWaterContent;
+        std::vector<double> vaporContent;
+        std::vector<double> iceContent;
+        std::vector<NodeFlux> heatFlux;
+        std::vector<NodeFlux> waterFlux;
+        double temperatureError;
+        double humidityError;
+        //! False for a steady-state solve that stopped on its pass budget with the fields
+        //! still changing by more than the tolerance; the errors above say by how much.
+        //! Transient steps always report true.
+        bool converged{true};
+        //! Number of coupled passes a steady-state solve took; zero for transient steps.
+        std::size_t steadyPasses{0};
+    };
+
+    //! Per-field results (values + errors) accumulated over multiple timesteps.
+    struct FieldResults
+    {
+        std::vector<std::vector<double>> values;
+        std::vector<double> errors;
+    };
+
+    //! Accumulated results from a multi-step transient simulation.
+    struct TransientResults
+    {
+        FieldResults temperature;
+        FieldResults moisture;
+    };
+
+    class MultiDomain
+    {
+    public:
+        //! Default construction of MultiDomain with default values
+        MultiDomain();
+
+        //! Construction of MultiDomain from params struct (C++20 designated initializers)
+        explicit MultiDomain(MultiDomainParams params);
+
+        //! \brief Calculates next timestep value from current values
+        //! \param temperature vector of nodal temperatures from previous timestep
+        //! \param humidity vector of nodal humidity from previous timestep
+        //! \param t_DTime time between two timestep
+        //! \param timestepIndex current timestep index used in variable boundary conditions case
+        Solution transient(const std::vector<double> & temperature,
+                           const std::vector<double> & humidity,
+                           double t_DTime,
+                           size_t timestepIndex = 0);
+
+        //! \brief The steady state of the coupled domains: the steady equations solved as such,
+        //! no time variable, no storage terms.
+        //!
+        //! Each pass is one steady Newton solve per domain (IDomain::steadyNewton), moisture
+        //! first and then thermal with the humidities just solved, starting from the current
+        //! node values. The solve is converged once neither field changes by more than the
+        //! tolerance between passes and both steady residuals are below it; the passes then
+        //! continue while each still halves the change, so the reported field sits at the
+        //! solvers' floor rather than at the tolerance.
+        //!
+        //! A part of the model that exchanges no moisture at any boundary has a steady
+        //! humidity profile only up to its water. It keeps the water of the start
+        //! humidities: one of its flux equations, which is redundant, gives way to that
+        //! condition (IDomain::holdSealedRegions), so the result is the state a transient
+        //! run from the same start settles to. If such a part reaches a humidity bound and
+        //! cannot keep its water, the solution is returned with converged = false. A sealed
+        //! part whose materials store no water has no such condition and is refused with a
+        //! runtime_error.
+        Solution steadyState();
+
+        //! Snapshot of the current node state as a zero-duration Solution. Called before the
+        //! first transient step it captures the initial conditions -- the "timestep 0" frame
+        //! of a transient result series. Water, liquid, vapor and ice contents come from the
+        //! node state exactly as any solved frame's would; the fluxes are identically zero,
+        //! which is exact for the uniform initial state.
+        [[nodiscard]] Solution currentStateSolution();
+
+        //! Runs a multi-step transient simulation, collecting per-step
+        //! temperature and moisture results. Initial conditions are read
+        //! from the current node state.
+        //! @param dTime Timestep duration
+        //! @param numSteps Number of timesteps to run
+        TransientResults transientMultiStep(double dTime, size_t numSteps);
+
+        //! \brief Checks validity of materials for any simulation
+        //!
+        //! \param simulationType Enumerator for simulation type (SteadyState or Transient)
+        //! \return Information about materials with all missing properties.
+        MaterialsErrorCheckVector checkForMaterialsValidity(SimulationType simulationType) const;
+
+        //! \brief Sets if moisture simulation will be performed
+        //!
+        //! @param val if set to true, moisture simulation will be performed
+        void performMoistureSimulation(bool val);
+
+        //! \brief Checks if moisture simulation is ON
+        bool isMoistureSimulationON() const;
+
+        //! \brief Sets if thermal simulation will be performed
+        //!
+        //! @param val if set to true, thermal simulation will be performed
+        void performThermalSimulation(bool val);
+
+        //! \brief Checks if thermal simulation is ON
+        bool isThermalSimulationON() const;
+
+        std::vector<double> property(Variable property) const;
+
+        //! \brief Creates element with material reference using C++20 designated initializers
+        //! @param params Element parameters (node1, node2, node3, node4, material)
+        void createElement(const ElementParams & params);
+
+        //! \brief Creates boundary condition with coefficients that are identical during the entire
+        //! transient simulation or in steady-state calculations
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param fixedBchcCoefficients Structure with values that are used in fixed convection
+        //! coefficient boundary condition calculations
+        void createBC_FixedHc(size_t index1,
+                              size_t index2,
+                              const FixedBCHCCoefficients & fixedBchcCoefficients);
+
+        //! \brief Creates set of boundary condition coefficients that are used during transient
+        //! simulation
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param fixedBchcCoefficients Structure with values that are used in fixed convection
+        //! coefficient boundary condition calculations
+        void createBC_FixedHc(size_t index1,
+                              size_t index2,
+                              const std::vector<FixedBCHCCoefficients> & fixedBchcCoefficients);
+
+        //! \brief Creates convection boundary condition with per-field cyclic
+        //! series (thermal + moisture domains when moisture is simulated).
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coefficients Cyclic series for air temperature, film
+        //! coefficient and air humidity, each cycling with its own period
+        void createBC_PeriodicHc(size_t index1,
+                                 size_t index2,
+                                 const FixedHcPeriodicCoefficients & coefficients);
+
+        //! \brief Creates boundary condition with coefficients that are identical during the entire
+        //! transient simulation or in steady-state calculations
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param varHCCoeff Structure with values that are used in variable convection
+        //! coefficient boundary condition calculations
+        //! @param Surface tilt at the boundary [degrees]
+        void createBC_TARPHc(size_t index1,
+                             size_t index2,
+                             const TARPCoefficients & varHCCoeff,
+                             double surfaceTilt = 90);
+
+        //! \brief Creates set of boundary condition coefficients that are used during transient
+        //! simulation
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param varHCCoeff Structure with values that are used in variable convection
+        //! coefficient boundary condition calculations
+        //! @param Surface tilt at the boundary [degrees]
+        void createBC_TARPHc(size_t index1,
+                             size_t index2,
+                             const std::vector<TARPCoefficients> & varHCCoeff,
+                             double surfaceTilt = 90);
+
+        //! \brief Creation of ASHRAE inside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        //! @param surfaceHeight Surface height at the boundary [meters]
+        //! @param surfaceTilt Surface tilt at the boundary [degrees]
+        void createBC_ASHRAEInsideHc(size_t index1,
+                                     size_t index2,
+                                     const ASHRAEInsideCoefficients & coeff,
+                                     double surfaceHeight,
+                                     double surfaceTilt = 90);
+
+        //! \brief Creation of ASHRAE inside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        //! @param surfaceHeight Surface height at the boundary [meters]
+        //! @param surfaceTilt Surface tilt at the boundary [degrees]
+        void createBC_ASHRAEInsideHc(size_t index1,
+                                     size_t index2,
+                                     const std::vector<ASHRAEInsideCoefficients> & coeff,
+                                     double surfaceHeight,
+                                     double surfaceTilt = 90);
+
+        //! \brief Creation of ASHRAE outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_ASHRAEOutsideHc(size_t index1,
+                                      size_t index2,
+                                      const ASHRAEOutsideCoefficients & coeff);
+
+        //! \brief Creation of ASHRAE outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_ASHRAEOutsideHc(size_t index1,
+                                      size_t index2,
+                                      const std::vector<ASHRAEOutsideCoefficients> & coeff);
+
+        //! \brief Creation of Yazdanian-Klems outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_YazdanianKlemsHc(size_t index1,
+                                       size_t index2,
+                                       const YazdanianKlemsCoefficients & coeff);
+
+        //! \brief Creation of Yazdanian-Klems outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_YazdanianKlemsHc(size_t index1,
+                                       size_t index2,
+                                       const std::vector<YazdanianKlemsCoefficients> & coeff);
+
+        //! \brief Creation of Kimura outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_KimuraHc(size_t index1,
+                               size_t index2,
+                               const std::vector<KimuraCoefficients> & coeff);
+
+        //! \brief Creation of Kimura outside convection boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param coeff Structure to hold variable convection coefficients that are variable
+        //! through timesteps
+        void createBC_KimuraHc(size_t index1, size_t index2, const KimuraCoefficients & coeff);
+
+        //! \brief Sets fixed temperature boundary conditions
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temp1 Temperature value that will be set at the node 1
+        //! @param temp2 Temperature value that will be set at the node 2
+        void createBC_FixedTemperature(size_t index1, size_t index2, double temp1, double temp2);
+
+        //! \brief Sets fixed temperature boundary conditions
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temp Set of node temperatures for every given timstep (each node can have
+        //! different temperature).
+        void createBC_FixedTemperature(size_t index1,
+                                       size_t index2,
+                                       const std::vector<ConstantBCTemperatures> & temp);
+
+        //! \brief Sets fixed temperature boundary conditions
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temp Temperature value that will be set at the nodes
+        void createBC_FixedTemperature(size_t index1, size_t index2, double temp);
+
+        //! \brief Sets fixed temperature boundary conditions at every timestep
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temp Temperature values at every timestep that will be set at the nodes
+        void createBC_FixedTemperature(size_t index1, size_t index2, std::vector<double> temp);
+
+        //! \brief Sets constant temperature and humidity at the boundary
+        //!
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param values Temperature and humidity values that will be set at the nodes
+        void createBC_FixedTemperatureAndHumidity(size_t index1, size_t index2, const TemperatureAndHumidity & values);
+
+        //! \brief Sets constant temperature and humidity at the boundary
+        //!
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param values Temperature and humidity values that will be set at the nodes
+        void createBC_FixedTemperatureAndHumidity(size_t index1, size_t index2, const std::vector<TemperatureAndHumidity> & values);
+
+        //! \brief Sets cyclic temperature and humidity pins at the boundary
+        //!
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param temperatures Cyclic temperature pin series
+        //! @param humidities Cyclic humidity pin series
+        void createBC_PeriodicTemperatureAndHumidity(
+          size_t index1,
+          size_t index2,
+          PeriodicSeries temperatures,
+          PeriodicSeries humidities);
+
+        //! \brief Creation of flux boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Flux Constant flux in both nodes
+        void createBC_FixedHeatFlux(size_t index1, size_t index2, double t_Flux);
+
+        //! \brief Creation of flux boundary condition
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Flux Constant flux in both nodes
+        void createBC_FixedHeatFlux(size_t index1, size_t index2, std::vector<double> t_Flux);
+
+        //! \brief Sets radiation boundary condition that is fixed during entire transient
+        //! simulation or set for steady-state case
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param t_Emissivity Surface emissivity
+        //! @param t_RadiationTemperature Environment radiation temperature
+        void createBC_BlackBodyRadiation(size_t index1,
+                                         size_t index2,
+                                         double t_Emissivity,
+                                         double t_RadiationTemperature);
+
+        //! \brief Sets radiation boundary condition that is fixed during entire transient
+        //! simulation or set for steady-state case
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param radCoeffs Radiation coefficients for every timestep
+        void createBC_BlackBodyRadiation(
+          size_t index1,
+          size_t index2,
+          const std::vector<BlackBodyRadiationBCCoefficients> & radCoeffs);
+
+        //! \brief Sets radiation boundary condition that is fixed during entire transient
+        //! simulation or set for steady-state case
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param radCoeffs Radiation coefficients for entire transient simulation or steady-state
+        void createBC_LinearizedRadiation(size_t index1,
+                                          size_t index2,
+                                          const LinearizedRadiationBCCoefficients & linearRadBC);
+
+        //! \brief Sets radiation boundary condition that is fixed during entire transient
+        //! simulation or set for steady-state case
+        //! @param index1 Node 1 index
+        //! @param index2 Node 2 index
+        //! @param radCoeffs Radiation coefficients for every timestep
+        void createBC_LinearizedRadiation(
+          size_t index1,
+          size_t index2,
+          const std::vector<LinearizedRadiationBCCoefficients> & linearRadBC);
+
+        //! \brief Creates enclosure radiation boundary conditions (thermal).
+        //! @param segments Enclosure radiation segments (node indices, emissivity, enclosure id).
+        //! @param openEnclosureTemperatures Environment temperature [C] for each open enclosure id.
+        //! @param smoothViewFactors Apply least-squares smoothing to closed enclosures.
+        void createEnclosureRadiation(
+          const std::vector<EnclosureRadiationSegment> & segments,
+          const std::map<std::size_t, double> & openEnclosureTemperatures = {},
+          bool smoothViewFactors = true,
+          EnclosureSurfaceTemperature surfaceTemperature =
+            EnclosureSurfaceTemperature::SegmentIsothermal);
+
+        //! \brief Sets new gravity vector and performs new calculations
+        //!
+        //! @param gravityVector Direction of gravity
+        void setGravityVector(const FenestrationCommon::GravityVector & gravityVector);
+
+        //! \brief Overrides the emissivity of one frame cavity boundary segment in both
+        //! domains. See IDomain::setCavitySurfaceEmissivity.
+        void setCavitySurfaceEmissivity(std::size_t node1, std::size_t node2, double emissivity);
+
+        //! \brief Result of the thermal domain's last frame cavity update. See
+        //! IDomain::gasCavityStates.
+        [[nodiscard]] std::vector<GasCavityState> gasCavityStates() const;
+
+        //! \brief Assign observer to thermal part of the engine.
+        //!
+        //! @param observer observer that will be notified about each timestep
+        void subscribeThermal(Timesteps::TimestepObserver * observer);
+
+        //! \brief Unsubscribe from thermal notifications
+        //!
+        //! @param observer observer that will be notified about each timestep
+        void unsubscribeThermal(Timesteps::TimestepObserver * observer);
+
+        //! \brief Assign observer to moisture part of the engine.
+        //!
+        //! @param observer observer that will be notified about each timestep
+        void subscribeMoisture(Timesteps::TimestepObserver * observer);
+
+        //! \brief Unsubscribe from moisture notifications
+        //!
+        //! @param observer observer that will be notified about each timestep
+        void unsubscribeMoisture(Timesteps::TimestepObserver * observer);
+
+        //! @brief Deletes Geometry and boundary conditions
+        void clearModel();
+
+        //! @brief Access to materials owned by this MultiDomain
+        //! @return Reference to the MaterialPool instance
+        Materials & materials();
+
+        //! @brief Const access to materials owned by this MultiDomain
+        //! @return Const reference to the MaterialPool instance
+        [[nodiscard]] const Materials & materials() const;
+
+        //! \brief Attach a diagnostic stream for solver iteration logging.
+        //! Forwards to both thermal and moisture domains as well.
+        void setDiagnosticStream(std::ostream * stream);
+
+        //! \brief Inject solver configuration for the coupling loop and both sub-domains.
+        //!
+        //! When not set, the global SimulationProperties / Timesteps singletons are read at solve
+        //! time, preserving the historical behaviour.
+        void setSolverSettings(const SolverSettings & settings);
+
+        //! \brief Inject the physics-model flags for the coupling loop and both sub-domains.
+        //!
+        //! Element constructors read the flags to decide which equation terms to register, so
+        //! this must be called BEFORE the geometry is built (the first createElement call). When
+        //! not set, the global SimulationProperties singleton is read, preserving the historical
+        //! behaviour.
+        void setPhysicsOptions(const PhysicsOptions & options);
+
+        //! \brief The physics flags this multi-domain solves with: the injected value, or a
+        //! snapshot of the process-global singleton when none was injected.
+        [[nodiscard]] PhysicsOptions physicsOptions() const;
+
+        //! @brief Access to thermal domain for single-domain operations
+        //! @return Reference to the ThermalDomain
+        ThermalDomain & thermal();
+
+        //! @brief Access to moisture domain for single-domain operations
+        //! @return Reference to the MoistureDomain
+        MoistureDomain & moisture();
+
+        //! @brief Access to node pool used by this MultiDomain
+        //! @return Reference to the NodePool instance
+        Nodes & nodes();
+
+        //! @brief Const access to node pool used by this MultiDomain
+        //! @return Const reference to the NodePool instance
+        [[nodiscard]] const Nodes & nodes() const;
+
+        //! \brief Boundary heat exchange booked by the most recent transient() call,
+        //! summed over every accepted coupled sub-step (including internal subdivision
+        //! and shock-chain micro-steps). Keyed by the boundary element's FEM node
+        //! indexes; units J/m, outward-positive. Evaluated post-acceptance on each
+        //! sub-step's accepted state. Empty when thermal simulation is off.
+        [[nodiscard]] const std::map<std::pair<size_t, size_t>, double> &
+          stepBoundaryHeatExchange() const
+        {
+            return m_StepBoundaryHeatExchange;
+        }
+
+        //! \brief Boundary moisture exchange booked by the most recent transient()
+        //! call; same conventions as stepBoundaryHeatExchange(), units kg/m.
+        //! Empty when moisture simulation is off.
+        [[nodiscard]] const std::map<std::pair<size_t, size_t>, double> &
+          stepBoundaryWaterExchange() const
+        {
+            return m_StepBoundaryWaterExchange;
+        }
+
+    private:
+        //! \brief Checks validity of materials for transient simulation
+        [[nodiscard]] MaterialsErrorCheckVector checkMaterialsForTransientSimulation() const;
+
+        //! \brief Checks validity of materials for transient simulation
+        [[nodiscard]] MaterialsErrorCheckVector checkMaterialsForSteadyStateSimulation() const;
+
+        static double normError(const std::vector<double> & vec1, const std::vector<double> & vec2);
+
+        //! Merges one domain's pending per-call boundary exchange into a step ledger.
+        static void mergeBoundaryExchange(
+          std::map<std::pair<size_t, size_t>, double> & ledger,
+          const std::map<std::pair<size_t, size_t>, double> & pending);
+
+        //! The two fields a steady pass carries between the domains.
+        struct SteadyFields
+        {
+            std::vector<double> temperature;
+            std::vector<double> humidity;
+        };
+
+        //! Per-field errors of a steady pass: the change since the previous pass, or the steady
+        //! residual once the change is within tolerance (see steadyPassError).
+        struct SteadyErrors
+        {
+            double temperature{0.0};
+            double humidity{0.0};
+        };
+
+        //! Makes the moisture solve keep, in every part of the model that exchanges no
+        //! moisture, the water of the given humidities (IDomain::holdSealedRegions). Throws
+        //! when such a part stores no water at all.
+        void holdSealedMoisture(const std::vector<double> & humidity);
+
+        //! True when every sealed part still holds its start water within the tolerance at
+        //! the nodes' current state.
+        [[nodiscard]] bool sealedMoistureHeld(double tolerance) const;
+
+        //! One pass of the steady solve: a steady Newton per simulated domain, moisture first.
+        //! Each Newton leaves its domain's nodes at the returned field, so the thermal solve
+        //! that follows sees the humidities just solved.
+        [[nodiscard]] SteadyFields steadyPass(const SteadyFields & fields);
+
+        //! Relative change of each simulated field over a pass; zero for a field not simulated.
+        [[nodiscard]] SteadyErrors passChange(const SteadyFields & previous,
+                                              const SteadyFields & current) const;
+
+        //! The pass errors: each field's change, or its steady residual at the nodes' current
+        //! state once the change is within tolerance (see steadyPassError).
+        [[nodiscard]] SteadyErrors withResiduals(const SteadyErrors & change, double tolerance);
+
+        //! Writes the final fields of a steady solve to the nodes and packs the Solution:
+        //! the equilibrium liquid/ice split, the contents and the fluxes at that state.
+        [[nodiscard]] Solution steadySolution(const SteadyFields & fields,
+                                              const SteadyErrors & errors,
+                                              bool converged,
+                                              std::size_t passes);
+
+        //! Returns the injected solver settings, or a snapshot of the global singletons when none
+        //! has been injected (preserving the historical live-read behaviour).
+        [[nodiscard]] SolverSettings solverSettings() const;
+
+        // NodePool owned by MultiDomain - each MultiDomain has its own node pool
+        Nodes m_Nodes;
+        // MaterialPool owned by MultiDomain - must be declared before domains (initialization order)
+        Materials m_Materials;
+        ThermalDomain m_ThermalDomain;
+        MoistureDomain m_MoistureDomain;
+        bool m_SimulateThermal;
+        bool m_SimulateMoisture;
+        std::ostream * m_DiagStream{nullptr};
+
+        //! Optional injected solver configuration. Empty means "read the global singletons live".
+        std::optional<SolverSettings> m_SolverSettings;
+
+        //! Optional injected physics flags. Empty means "read the global singleton live".
+        std::optional<PhysicsOptions> m_PhysicsOptions;
+
+        //! Boundary exchange booked per public timestep: accepted sub-step sums
+        //! committed only after both coupled solves of a sub-step succeed.
+        std::map<std::pair<size_t, size_t>, double> m_StepBoundaryHeatExchange;
+        std::map<std::pair<size_t, size_t>, double> m_StepBoundaryWaterExchange;
+    };
+
+}   // namespace HygroThermFEM

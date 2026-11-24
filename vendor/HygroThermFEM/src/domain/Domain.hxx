@@ -1,0 +1,566 @@
+#pragma once
+
+#include <iosfwd>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include "lbnl/expected.hxx"
+
+#include "Elements2D.hxx"
+#include "BoundaryConditions2D.hxx"
+#include "LinearSolver.hxx"
+#include "GasCavities.hxx"
+#include "BoundaryConditionCoefficients.hxx"
+#include "TimestepNotifier.hxx"
+#include "TimestepObserver.hxx"
+#include "Materials.hxx"
+#include "Nodes.hxx"
+#include "PhysicsOptions.hxx"
+#include "SolverSettings.hxx"
+
+namespace HygroThermFEM
+{
+    //! \brief Class to hold solution from single timestep.
+    struct SingleSolution
+    {
+        std::vector<double> solution;   //!< Solution from single transient step
+        double dTime;   //!< Timestep for which solution has been performed. Engine can adopt new
+                        //!< timestep for which solution will converge.
+    };
+
+    //! \brief Reason a transient solve failed to converge.
+    //!
+    //! Non-convergence is an expected outcome (not a programmer error), so it is reported as the
+    //! error arm of an ExpectedExt rather than thrown from the hot path.
+    struct SolverError
+    {
+        double dtTried;        //!< Timestep at which the final (failed) attempt was made
+        size_t divisions;      //!< Number of subdivision levels exhausted before giving up
+        double lastResidual;   //!< Residual norm of the last (failed) attempt
+    };
+
+    //! \brief The timestep at which the transient system is the steady system.
+    //!
+    //! The storage terms of the transient equations scale with the capacity over the step, so
+    //! at an infinite step they vanish and what remains is conductance, boundary exchange and
+    //! sources: the steady equations. The Newton machinery assembles that system when it is
+    //! given this step (see IDomain::transientSystem), which is how the direct steady solve
+    //! reuses the transient's Newton, line search, Jacobian and active set unchanged.
+    inline constexpr double steadyStateStep{std::numeric_limits<double>::infinity()};
+
+    //! \brief Result of one steady Newton solve of a single domain (see IDomain::steadyNewton).
+    struct SteadyNewtonResult
+    {
+        std::vector<double> solution;   //!< The last iterate, converged or not
+        bool converged{false};          //!< False when the iteration budget ran out first
+    };
+
+    //! \brief A connected region of a domain that exchanges nothing with the surroundings
+    //! (see IDomain::sealedRegions).
+    struct SealedRegion
+    {
+        std::vector<std::size_t> dofs;   //!< Zero-based degrees of freedom of the region
+        std::size_t anchor{0u};          //!< The row that carries the stored-amount condition:
+                                         //!< the degree of freedom with the largest capacity
+        double capacity{0.0};            //!< Sum of the lumped storage capacities of the region
+        double rowScale{0.0};            //!< Brings the storage row to the size of the flux rows
+    };
+
+    //! \brief Interface that will keep all elements and boundary conditions together.
+    //!
+    //! One domain will solve single differential equation and therefore, single domain will
+    //! represent thermal, moisture or pressure separately.
+    class IDomain : public Timesteps::TimestepNotifier
+    {
+    public:
+        virtual ~IDomain() = default;
+        //! Domain construction.
+        explicit IDomain(
+          Nodes & nodePool,           //!< Reference to the NodePool for node lookups
+          Materials & materialPool,   //!< Reference to the MaterialPool for material lookups
+          bool automaticUpdateOfPreviousTimestep =
+            true   //!< When solver finds solution, previous timestep will be automatically updated
+                   //!< by default. This should be set to false is Domain is used in outside
+                   //!< iterations for solving more complex problems in which case previous timestep
+                   //!< should not be updated till convergence is achieved.
+        );
+
+        //! Calculates steady state for given data. When the domain's solution variable has
+        //! physical bounds (solutionBounds), the solve enforces them: out-of-bound degrees of
+        //! freedom are pinned to the violated bound (penalty rows) and the system is re-solved
+        //! until no new violation appears -- an active-set projection. The active set is rebuilt
+        //! on every call (matrices are reassembled), so nodes pinned under one coupled iterate
+        //! are free again under the next.
+        std::vector<double> steadyState();
+
+        //! \brief Newton solve of this domain's steady equations from the given start.
+        //!
+        //! The system is the transient one at steadyStateStep: no storage terms, the other
+        //! fields frozen at their node values. Bounded domains (moisture) keep their exact
+        //! Jacobian and active set, unbounded ones (thermal) their lagged-coefficient
+        //! correction. There is no timestep to subdivide, so an exhausted iteration budget
+        //! returns the last iterate with converged = false; the caller's coupling loop decides
+        //! what to do with it.
+        [[nodiscard]] SteadyNewtonResult steadyNewton(const std::vector<double> & start);
+
+        //! \brief The connected regions of the domain that exchange nothing with the
+        //! surroundings: no boundary condition couples any of their nodes through a transfer
+        //! coefficient (no non-zero entry of the boundary H matrix).
+        //!
+        //! The flux equations of such a region sum to zero identically, so one of them is
+        //! redundant and the steady field is fixed only up to the amount the region stores
+        //! (a sealed moisture region: its humidity profile up to its water). Read at the
+        //! nodes' current state.
+        [[nodiscard]] std::vector<SealedRegion> sealedRegions();
+
+        //! \brief Makes the steady system hold the amount each given region stores at the
+        //! start field.
+        //!
+        //! In the system at steadyStateStep the redundant flux row of every region (its
+        //! anchor) is replaced by the sum of the region's storage rows,
+        //! sum_j M_jj (u_j - start_j) = 0, with M the lumped capacity of the transient
+        //! system. With the secant capacity that sum is the stored amount at u minus the
+        //! stored amount at the start, the quantity a transient step conserves. The nodes'
+        //! previous-timestep values are set to the start field, which is what the secant
+        //! is taken against. Stays in force until releaseSealedRegions().
+        void holdSealedRegions(const std::vector<SealedRegion> & regions,
+                               const std::vector<double> & start);
+
+        //! Back to the plain steady system.
+        void releaseSealedRegions();
+
+        //! \brief Largest relative difference, over the held regions, between the amount
+        //! stored at the nodes' current state and at the start field; zero when no region
+        //! is held. A region whose anchor is pinned at a physical bound loses its
+        //! stored-amount row to the pin, and shows here.
+        [[nodiscard]] double sealedStorageDrift() const;
+
+        //! Relative residual of the steady equations at the current node state: the system at
+        //! steadyStateStep, which carries no storage terms, so ||R - (K + H) U|| over the free
+        //! DOFs (see constrainedDofs) remains, divided by ||vecB||. A field that has not reached
+        //! the steady state shows a residual here even when it barely moved since the previous
+        //! pass.
+        [[nodiscard]] double steadyStateResidual();
+
+        //! Physical range of the domain's solution variable, or nullopt when unbounded.
+        //! Humidity is a fraction in [0, 1]: above saturation is condensation, which an
+        //! unconstrained steady vapor solve otherwise reports as Glaser-style supersaturation
+        //! (the transient solver already clamps its Newton corrections to the same range).
+        //! Temperature has no such box.
+        [[nodiscard]] virtual std::optional<std::pair<double, double>> solutionBounds() const;
+
+        //! \brief Calculates next timestep values from current (initial) values
+        //! @param currentStateValues Current values of state variable or initial condition
+        //! @param t_DTime Timestep in transient solution
+        //! @param timestepIndex Index for current timestep. Used in variable boundary conditions
+        //! case. It is defaulted to zero in case of non-variable boundary condition calculations
+        //! are requested.
+        //! Returns the solved timestep, or a SolverError if convergence could not be reached even
+        //! after exhausting sub-timestep subdivision. Non-convergence is reported, never thrown.
+        lbnl::ExpectedExt<SingleSolution, SolverError> transient(
+          const std::vector<double> & currentStateValues, double t_DTime, size_t timestepIndex = 0);
+
+        //! Runs a multi-step transient simulation on a single domain,
+        //! collecting the solution vector at each timestep.
+        //! @param variable Which node property to use as initial condition
+        //! @param dTime Timestep duration
+        //! @param numSteps Number of timesteps to run
+        std::vector<std::vector<double>> transientMultiStep(Variable variable,
+                                                            double dTime,
+                                                            size_t numSteps);
+
+        //! Returns flux in x and y direction
+        [[nodiscard]] std::vector<NodeFlux> flux() const;
+
+        //! \brief Per boundary-condition-element heat rates from the solved node values.
+        //! The consistent boundary-side reintegration sum((H*u - R)) per boundary element;
+        //! positive when heat leaves the domain (see BoundaryConditions2D::heatRates).
+        //! @param variable State variable of this domain (Variable::temperature for thermal).
+        //! @param timestepIndex Timestep index used to select variable boundary conditions;
+        //!                      zero for steady state or constant conditions.
+        [[nodiscard]] std::vector<BoundaryHeatRate> boundaryHeatRates(
+          Variable variable, size_t timestepIndex = 0) const;
+
+        //! \brief Boundary exchange accumulated over the accepted sub-steps of the most
+        //! recent transient() call, keyed by the two FEM node indexes of each boundary
+        //! element. Each accepted sub-step contributes rate * dt evaluated on the accepted
+        //! state of that sub-step (post-acceptance evaluation, including shock-chain
+        //! micro-steps); discarded attempts and non-converged retries contribute nothing.
+        //! The map is rebuilt on every transient() call, so coupling probes or redo solves
+        //! leave behind only their own interval's exchange -- the caller must merge a value
+        //! into its own ledger only when the whole coupled sub-step is accepted.
+        //! Units are energy/mass rate times seconds per metre of depth (J/m for the
+        //! thermal domain, kg/m for the moisture domain), outward-positive.
+        [[nodiscard]] std::map<std::pair<size_t, size_t>, double>
+          pendingBoundaryExchange() const
+        {
+            return m_PendingBoundaryExchange;
+        }
+
+        //! \brief Read-only access to the domain's elements.
+        //! Used by the error-estimator adapter to assemble per-element Gauss-point data from a
+        //! solved domain.
+        [[nodiscard]] const ElementsLinear2D & elements() const;
+
+        //! \brief Sets the same constant volumetric source on every element of this
+        //! domain [W/m^3 for the thermal domain]. Enters the right hand-side vector as
+        //! the consistent load q * integral(psi_i dA).
+        void setVolumetricSource(double value);
+
+        //! \brief Sets a constant volumetric source per element, in element creation
+        //! order; the vector size must match the number of elements.
+        void setVolumetricSource(const std::vector<double> & perElement);
+
+        //! Adds element into domain
+        virtual void createElement(
+          size_t index1,                     //!< Node 1 index
+          size_t index2,                     //!< Node 2 index
+          size_t index3,                     //!< Node 3 index
+          size_t index4,                     //!< Node 4 index
+          const std::string & materialName   //!< SolidMaterial that will be assigned to the element
+          ) = 0;
+
+        //! \brief Sets new gravity vector and performs new calculations
+        //!
+        //! @param gravityVector Direction of gravity
+        void setGravityVector(const FenestrationCommon::GravityVector & gravityVector);
+
+        //! \brief Overrides the emissivity of one frame cavity boundary segment.
+        //!
+        //! The segment is given by its two node numbers in either order. Segments without an
+        //! override take the emissivity of the solid material adjacent to them. Calling this
+        //! after a solve discards the cavities built so far; they are rebuilt with the new
+        //! overrides at the next post-process.
+        //!
+        //! @param node1 Node number at one end of the segment
+        //! @param node2 Node number at the other end of the segment
+        //! @param emissivity Emissivity of the cavity surface along the segment
+        void setCavitySurfaceEmissivity(std::size_t node1, std::size_t node2, double emissivity);
+
+        //! \brief Recomputes the equivalent conductivity of every frame cavity from the current
+        //! node temperatures, building the cavities on the first call.
+        //!
+        //! The transient solver does this through postProcess after each Newton step. The
+        //! steady-state coupling loop has no Newton step, so MultiDomain calls it after each
+        //! pass; the cavities then iterate together with the temperature field, as they do in
+        //! the transient solver.
+        void updateGasCavities();
+
+        //! \brief Result of the last frame cavity update, one entry per cavity in creation
+        //! order; empty before the first update.
+        [[nodiscard]] std::vector<GasCavityState> gasCavityStates() const;
+
+        //! \brief Deletes geometry and clears up boundary conditions.
+        //! Virtual so derived domains can also clear domain-specific state (e.g. ThermalDomain's
+        //! enclosure-radiation coordinators) between consecutive runs on the same domain.
+        virtual void clearModel();
+
+        //! \brief Attach a diagnostic stream for solver iteration logging.
+        //! When non-null, the solver prints per-iteration details (NR corrections,
+        //! convergence metrics, sub-timestep divisions) to this stream.
+        //! Pass nullptr to disable. The caller owns the stream lifetime.
+        void setDiagnosticStream(std::ostream * stream);
+
+        //! \brief Inject solver configuration for this domain.
+        //!
+        //! When not set, the domain reads the process-global SimulationProperties / Timesteps
+        //! singletons at solve time, preserving the historical behaviour.
+        void setSolverSettings(const SolverSettings & settings);
+
+        //! \brief Inject the physics-model flags for this domain.
+        //!
+        //! Element constructors read the flags to decide which equation terms to register, so
+        //! this must be called BEFORE the first createElement call. When not set, the domain
+        //! reads the process-global SimulationProperties singleton, preserving the historical
+        //! behaviour.
+        void setPhysicsOptions(const PhysicsOptions & options);
+
+        //! \brief The physics flags this domain solves with: the injected value, or a snapshot
+        //! of the process-global singleton when none was injected.
+        [[nodiscard]] PhysicsOptions physicsOptions() const;
+
+    protected:
+        //! Some domains require post-processing of results. Good example is
+        //! moisture domain where humidity cannot go over 1.0 or lower than one.
+        //! With certain set of boundary conditions and long enough time-step,
+        //! solution can achieve such state and post processing should prevent it.
+        virtual void postProcess(std::vector<double> & solution);
+
+        //! Limits Newton-Raphson increment per DOF so the projected solution
+        //! stays within physical bounds. Called before applying dU.
+        virtual bool limitIncrement(const std::vector<double> & currentSolution,
+                                    std::vector<double> & increment,
+                                    double relaxParameter) const;
+
+        //! When true, this domain declares Newton-Raphson convergence from the *reduction* of
+        //! the residual over its free DOFs (see constrainedDofs) -- converged once the residual
+        //! has dropped to a fixed fraction of its value at the initial guess -- instead of from
+        //! the solution-change metric. Being relative to each problem's own initial residual,
+        //! this auto-scales and is independent of the relaxation / tolerance / max-iteration
+        //! settings, removing the solver's contribution to the parameter-sensitivity (D3). The
+        //! base returns false so thermal convergence stays byte-identical.
+        [[nodiscard]] virtual bool useResidualConvergence() const
+        {
+            return false;
+        }
+
+        //! Per-DOF mask marking bound-constrained DOFs (pinned at a physical bound). Their
+        //! equations are replaced by the bound constraint, so they carry an irreducible
+        //! residual and are excluded from the residual convergence test. Base: none.
+        [[nodiscard]] virtual std::vector<bool>
+          constrainedDofs(const std::vector<double> & solution) const
+        {
+            return std::vector<bool>(solution.size(), false);
+        }
+
+        //! Updates node values with solution. Implemented by derived classes.
+        virtual void updateNodes(const std::vector<double> & solution,
+                                 bool updatePreviousTimestep) = 0;
+
+        //! State variable this domain solves for. Used by the new-bound-hit retry to
+        //! manage the nodes' previous-timestep values across its internal substeps.
+        [[nodiscard]] virtual Variable stateVariable() const = 0;
+
+        //! When true, a converged step whose solution drove DOFs onto a physical bound they
+        //! did not start at (clamp overshoot -- the initial-condition/boundary shock of the
+        //! very first step, typically) is redone once as a bounded chain of equal substeps
+        //! (see resolveShockStep). Deliberately a SINGLE retry with a fixed substep count and
+        //! no recursion: the subdivide-on-every-clamp scheme is a known runaway. Base:
+        //! disabled (thermal has no bounded state variable).
+        [[nodiscard]] virtual bool retryStepOnNewBoundHit() const
+        {
+            return false;
+        }
+
+        Nodes & m_NodePool;
+        Materials & m_MaterialPool;
+        ElementsLinear2D m_Elements;
+        BoundaryConditions2D m_BCs;
+
+    private:
+        //! Forms left hand side matrix in steady state solution.
+        SquareMatrix steadyStateLeftHandSide();
+
+        //! Form right hand side vector in steady state solution.
+        [[nodiscard]] std::vector<double> steadyStateRightHandSide() const;
+
+        //! Left and right hand sides of the transient system for one timestep.
+        struct TransientSystem
+        {
+            SquareMatrix matA;          //!< Mass, conductance and boundary H matrices combined.
+            std::vector<double> vecB;   //!< M*U+R vector, where U is the state variable.
+        };
+
+        //! \brief Assembles both sides of the transient system.
+        //!
+        //! The two sides are always needed together and share the lumped mass vector, which is
+        //! why they are built in one pass: assembling them separately computed that vector twice
+        //! per Newton-Raphson iteration, and again for every line search attempt.
+        TransientSystem transientSystem(const std::vector<double> & t_PreviousSolution,
+                                        double t_DTime,
+                                        size_t timestepIndex);
+
+        //! The steady system with the anchor row of every held region replaced by the
+        //! region's stored-amount row (see holdSealedRegions).
+        [[nodiscard]] TransientSystem withStoredAmountRows(const SquareMatrix & matrix,
+                                                           std::vector<double> rhs) const;
+
+        //! True when the system assembled at this step carries stored-amount rows.
+        [[nodiscard]] bool holdsSealedRegions(double dTime) const;
+
+        //! Regions held by the steady system, empty outside a steady solve of a sealed region.
+        std::vector<SealedRegion> m_SealedRegions;
+        //! The field whose stored amount the held regions keep.
+        std::vector<double> m_SealedStart;
+        //! Per degree of freedom, the anchor row of its held region; noAnchor outside one.
+        std::vector<std::size_t> m_AnchorOfDof;
+        static constexpr std::size_t noAnchor{(std::numeric_limits<std::size_t>::max)()};
+
+        //! Returns if domain problem is linear.
+        [[nodiscard]] bool isLinear() const;
+
+        //! Returns the injected solver settings, or a snapshot of the global singletons when none
+        //! has been injected (preserving the historical live-read behaviour).
+        [[nodiscard]] SolverSettings solverSettings() const;
+
+        //! Result of a single timestep solve.
+        struct TimestepResult
+        {
+            std::vector<double> solution;
+            bool converged;
+            double residualNorm = 0.0;   //!< Residual norm of this attempt (used to report failure)
+        };
+
+        //! Tracks adaptive damping across Newton-Raphson iterations.
+        struct AdaptiveDamping
+        {
+            double prevDuNorm = (std::numeric_limits<double>::max)();
+            double factor = 1.0;
+            size_t consecutiveGrowth = 0;
+
+            void update(double rawDuNorm, size_t iteration, size_t minIteration);
+        };
+
+        //! Mutable state carried across Newton-Raphson iterations.
+        struct NRLoopState
+        {
+            std::vector<double> solution;
+            SquareMatrix matA;
+            std::vector<double> vecB;
+            double currentNorm;
+            double residualTarget = 0.0;   //!< Free-DOF residual below which the residual-
+                                           //!< reduction domains (moisture) are converged (D3)
+            std::vector<double> bestSolution{};   //!< Lowest-free-residual iterate seen so far,
+                                                  //!< returned on best-effort acceptance (D3)
+            double bestResidual = (std::numeric_limits<double>::max)();
+            double prevFreeResidual = (std::numeric_limits<double>::max)();   //!< previous
+                                                //!< iteration's free residual (adaptive relax, D3)
+            double prevMetric = (std::numeric_limits<double>::max)();
+            size_t numOfIterations = 0;
+            bool convergedViaClamp = false;
+            bool converged = false;
+            AdaptiveDamping damping;
+        };
+
+        //! Exact Jacobian J_ij = dF_i/du_j of the nonlinear residual F(u) = A(u) u - b(u) by
+        //! coloured finite differences: the columns are grouped so that no two columns of a
+        //! group share a row of the sparsity pattern, and one reassembly per group recovers
+        //! every column of that group. The group count depends on the mesh connectivity
+        //! (a few dozen at most), not on the mesh size. Bounded domains (moisture) use it in
+        //! place of the lagged-coefficient (Picard) correction, which is not a descent
+        //! direction where the liquid conductivity rises steeply with humidity
+        //! (2026-09-03, stucco/fiberglass wall: Picard crawled, Newton converged in 13 passes).
+        [[nodiscard]] SquareMatrix finiteDifferenceJacobian(const std::vector<double> & solution,
+                                                            const SquareMatrix & matA,
+                                                            const std::vector<double> & vecB,
+                                                            const std::vector<double> & currentStateValues,
+                                                            double dTime,
+                                                            size_t timestepIndex,
+                                                            const std::pair<double, double> & bounds);
+
+        //! Rebuilds the column groups when the pattern (size or non-zero count) or the held
+        //! state changed. Stored-amount rows are dense over their region and stay out of the
+        //! grouping, or every column of a region would need a reassembly of its own; their
+        //! Jacobian entries are separable by column and are taken from the row itself
+        //! (finiteDifferenceJacobian).
+        void ensureJacobianColumnGroups(const SquareMatrix & pattern, bool held);
+
+        std::vector<std::vector<std::size_t>> m_JacobianColumnGroups;
+        std::vector<std::vector<std::size_t>> m_JacobianRowsOfColumn;
+        std::size_t m_JacobianPatternSize{0};
+        std::size_t m_JacobianPatternNonZeros{0};
+        bool m_JacobianPatternHeld{false};
+
+        //! L2 norm of the residual (vecB - matA * solution) over the free DOFs only
+        //! (constrainedDofs excluded). Used by the residual-reduction convergence test and
+        //! the line search (D3).
+        [[nodiscard]] double freeDofResidualNorm(const std::vector<double> & solution,
+                                                 const SquareMatrix & matA,
+                                                 const std::vector<double> & vecB) const;
+
+        //! True when the residual of every free row is within a few rounding units of the
+        //! terms it is computed from, |b_i| + sum_j |A_ij| |u_j|. Such a residual is the
+        //! arithmetic's own and no iteration lowers it: a solve that starts on its solution
+        //! (a transient step from a steady state) has nothing to reduce, least of all on a
+        //! prescribed-value row, whose penalty multiplies the last bit of the nodal value.
+        //! The test is per row because those rows are many orders larger than the others.
+        [[nodiscard]] bool freeResidualAtRoundOff(const std::vector<double> & solution,
+                                                  const SquareMatrix & matA,
+                                                  const std::vector<double> & vecB) const;
+
+        //! \brief Calling timestep calculations
+        TimestepResult transientTimestep(
+          const std::vector<double> & currentStateValues, double t_DTime, size_t timestepIndex);
+
+        //! True when the solution has DOFs at a physical bound that were free at the step
+        //! start (overshoot clamped by postProcess) -- the trigger for the bound-hit retry.
+        [[nodiscard]] bool hasNewBoundHits(const std::vector<double> & startValues,
+                                           const std::vector<double> & solution) const;
+
+        //! Redo a shock step as a bounded chain of equal substeps (new-bound-hit retry).
+        //! Advances the nodes' previous-timestep values per substep (so the secant storage
+        //! capacity telescopes per substep) and restores them afterwards, because the caller
+        //! (MultiDomain coupling) owns the previous-timestep bookkeeping across the full step.
+        TimestepResult resolveShockStep(const std::vector<double> & startValues,
+                                        double t_DTime,
+                                        size_t timestepIndex);
+
+        //! Performs one Newton-Raphson iteration: correction, clamp check,
+        //! line search, convergence and oscillation checks.
+        void performNRIteration(NRLoopState & state,
+                                const std::vector<double> & currentStateValues,
+                                double relaxParameter,
+                                double convergenceError,
+                                size_t maxIterations,
+                                double dTime,
+                                size_t timestepIndex);
+
+        //! Result of a backtracking line search step.
+        struct LineSearchResult
+        {
+            std::vector<double> solution;
+            SquareMatrix matA;
+            std::vector<double> vecB;
+            double effectiveRelax;
+        };
+
+        //! Backtracking line search (Armijo-style). Shrinks the relaxation
+        //! factor until the residual norm decreases or attempts are exhausted.
+        LineSearchResult backtrackingLineSearch(const std::vector<double> & currentSolution,
+                                                const std::vector<double> & correctionDU,
+                                                double initialRelax,
+                                                double currentResidualNorm,
+                                                const std::vector<double> & currentStateValues,
+                                                double dTime,
+                                                size_t timestepIndex);
+
+        FenestrationCommon::GravityVector m_GravityVector{0, -1, 0};
+
+        //! Emissivity overrides for frame cavity boundary segments, handed to the gas cavities
+        //! when they are built.
+        CavitySurfaceEmissivities m_CavitySurfaceEmissivities;
+
+        //! Storage for gas cavities recalculation. Empty until the first post-process builds it
+        //! lazily; std::optional makes the "already created?" check and ownership explicit without
+        //! a heap allocation.
+        std::optional<EquivalentGasCavities> gasCavities;
+
+        //! Optional injected solver configuration. Empty means "read the global singletons live".
+        std::optional<SolverSettings> m_SolverSettings;
+
+        //! Residual below which a residual-reduction domain's Newton is converged for this step:
+        //! the reduction of the initial guess's residual.
+        [[nodiscard]] double residualTarget(const std::vector<double> & currentStateValues,
+                                            const SquareMatrix & matA,
+                                            const std::vector<double> & vecB);
+
+        //! Optional injected physics flags. Empty means "read the global singleton live".
+        std::optional<PhysicsOptions> m_PhysicsOptions;
+
+        bool m_AutomaticUpdatePreviousTimestep;
+        bool m_LastSolveAtPhysicalBound{false};
+
+        //! Persistent sparse solver: the system's sparsity pattern is fixed by the mesh, so the
+        //! symbolic factorization is analyzed once and reused across every solve of this domain.
+        CLinearSolver m_LinearSolver;
+
+        [[nodiscard]] bool lastSolveAtPhysicalBound() const;
+
+        //! Adds rate * dTime for every active boundary element to the pending exchange
+        //! ledger. Called once per accepted sub-step (and per accepted shock-chain
+        //! micro-step), after the accepted solution has been written back to the nodes,
+        //! so heatRates evaluates the state the accepted step was solved on.
+        void accumulateBoundaryExchange(double dTime, size_t timestepIndex);
+
+        //! Exchange accumulated over the accepted sub-steps of the current transient()
+        //! call; cleared at each transient() entry and at each internal shock-chain redo
+        //! so only the final accepted work of the call is reported.
+        std::map<std::pair<size_t, size_t>, double> m_PendingBoundaryExchange;
+
+        std::ostream * m_DiagStream{nullptr};
+    };
+
+}   // namespace HygroThermFEM

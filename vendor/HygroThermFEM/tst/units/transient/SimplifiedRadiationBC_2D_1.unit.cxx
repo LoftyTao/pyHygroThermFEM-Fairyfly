@@ -1,0 +1,56 @@
+#include <memory>
+#include <gtest/gtest.h>
+
+#include "HygroThermFEM2D.hxx"
+#include "TestHelpers.hxx"
+#include "TestMaterials.hxx"
+
+TEST(SimplifiedRadiationBC_2D_1, TestExample_1)
+{
+    SCOPED_TRACE("Begin Test: Two elementsCreator example with transient.");
+
+    HygroThermFEM::MultiDomain multiDomain({.performThermal = true, .performMoisture = false});
+
+    // same temperature in every node (humidity and pressure irrelevant for this example)
+    const auto state = HygroThermFEM::State{
+        .temperature = 0,
+        .humidity = 0,
+        .pressure = 101325,
+        .liquidPercent = 0
+    };
+
+    multiDomain.nodes().createNode({.index = 1, .x = 0.15, .y = 0.05, .state = state});
+    multiDomain.nodes().createNode({.index = 2, .x = 0.15, .y = 0, .state = state});
+    multiDomain.nodes().createNode({.index = 3, .x = 0.05, .y = 0.05, .state = state});
+    multiDomain.nodes().createNode({.index = 4, .x = 0.05, .y = 0, .state = state});
+    multiDomain.nodes().createNode({.index = 5, .x = 0, .y = 0.05, .state = state});
+    multiDomain.nodes().createNode({.index = 6, .x = 0, .y = 0, .state = state});
+
+    const auto & material = multiDomain.materials().createSolidMaterial(TestHelper::CottaerSandstoneNonPorous());
+
+    multiDomain.createElement({.node1 = 3, .node2 = 4, .node3 = 2, .node4 = 1, .material = material.name()});
+    multiDomain.createElement({.node1 = 6, .node2 = 4, .node3 = 3, .node4 = 5, .material = material.name()});
+
+    // Create Boundary Conditions
+    constexpr auto tRadiationTemperature = 20.0;
+    constexpr auto radiationCoefficient = 4.0;
+
+    const HygroThermFEM::LinearizedRadiationBCCoefficients linRad{radiationCoefficient,
+                                                                  tRadiationTemperature};
+
+    multiDomain.thermal().createBC_LinearizedRadiation(5, 6, linRad);
+
+    constexpr auto dTime = 3600;
+    constexpr auto nSteps = 4;
+
+    const auto solution = multiDomain.thermal().transientMultiStep(
+      HygroThermFEM::Variable::temperature, dTime, nSteps);
+
+    std::vector<std::vector<double>> correctSolution = {
+      {0.408268, 0.408268, 0.957192, 0.957192, 2.196879, 2.196879},
+      {1.065832, 1.065832, 1.949942, 1.949942, 3.393077, 3.393077},
+      {1.833106, 1.833106, 2.864722, 2.864722, 4.302987, 4.302987},
+      {2.633075, 2.633075, 3.708650, 3.708650, 5.097447, 5.097447}};
+
+    TestHelper::expectNear(correctSolution, solution, 1e-6);
+}

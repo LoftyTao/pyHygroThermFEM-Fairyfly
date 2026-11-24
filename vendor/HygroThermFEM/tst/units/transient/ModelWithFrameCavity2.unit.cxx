@@ -1,0 +1,133 @@
+#include <gtest/gtest.h>
+#include <memory>
+#include <set>
+
+#include "HygroThermFEM2D.hxx"
+#include "TestMaterials.hxx"
+
+using HygroThermFEM::State;
+using HygroThermFEM::ElementsLinear2D;
+using HygroThermFEM::ElementThermalLinear2D;
+
+
+TEST(TestModelWithFrameCavity2, TestDoubleFrameCavity)
+{
+    SCOPED_TRACE("Begin Test: Model with two frame cavities.");
+
+    // Create elements grid
+    HygroThermFEM::MultiDomain multiDomain({.performThermal = true, .performMoisture = false});
+
+    std::vector<double> gridX{0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07};
+    std::vector<double> gridY{0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35};
+
+    const State state({
+        .temperature = 20.0,
+        .humidity = 0.0,
+        .pressure = 101325.0
+    });
+
+    // Crating grid nodes
+    for(auto yVal : gridY)
+    {
+        for(auto xVal : gridX)
+        {
+            multiDomain.nodes().createNode({.x = xVal, .y = yVal, .state = state});
+        }
+    }
+
+    auto params = TestHelper::CottaerSandstone();
+    params.name = "Material 1";
+    params.liquidTransportCurve = {{0, 0}, {180, 2e-6}};
+    params.sorptionCurve = {{0, 0}, {1, 180}};
+    const auto & solidMaterial = multiDomain.materials().createSolidMaterial(params);
+
+    auto & frameCavity1 =
+      multiDomain.materials().createGas("Frame Cavity 1", HygroThermFEM::CavityStandard::ISO15099);
+
+    auto & frameCavity2 =
+      multiDomain.materials().createGas("Frame Cavity 2", HygroThermFEM::CavityStandard::CEN);
+
+    // Elements that will contain frame cavity
+    std::set<size_t> frameCavity1Element{10, 11, 17, 18, 23, 24, 25, 30, 31, 32};
+    std::set<size_t> frameCavity2Element{20, 21, 27, 28, 34, 35, 41, 42, 47, 48, 49};
+    size_t elementNumber{0u};
+    for(auto ix = 1u; ix < gridX.size(); ++ix)
+    {
+        for(auto iy = 1u; iy < gridY.size(); ++iy)
+        {
+            {
+                ++elementNumber;
+                const auto node1 = ix * gridX.size() + iy - gridX.size();
+                const auto node2 = ix * gridX.size() + iy - gridX.size() + 1u;
+                const auto node3 = ix * gridX.size() + (iy + 1u);
+                const auto node4 = ix * gridX.size() + iy;
+                std::string materialName;
+                if(frameCavity1Element.find(elementNumber) != frameCavity1Element.end())
+                {
+                    materialName = frameCavity1.name();
+                }
+                else if(frameCavity2Element.find(elementNumber) != frameCavity2Element.end())
+                {
+                    materialName = frameCavity2.name();
+                }
+                else
+                {
+                    materialName = solidMaterial.name();
+                }
+                multiDomain.createElement({.node1 = node1, .node2 = node2, .node3 = node3, .node4 = node4, .material = materialName});
+            }
+        }
+    }
+
+    // Create Boundary Conditions
+    constexpr auto tAir = 0.0;
+    constexpr auto hc = 30.0;
+
+    const HygroThermFEM::FixedBCHCCoefficients bcCoeff{tAir, hc};
+
+    // Build boundary condition nodes on left edge
+    std::vector<size_t> bcnodes;
+    for(size_t i = 0u; i < gridY.size(); ++i)
+    {
+        bcnodes.push_back(i * gridX.size() + 1);
+    }
+
+    // Now build boundary condition on left edge of domain rectangle
+    for(size_t i = 1u; i < bcnodes.size(); ++i)
+    {
+        multiDomain.thermal().createBC_FixedHc(bcnodes[i - 1u], bcnodes[i], bcCoeff);
+    }
+
+    // Now perform transient calculation in order to make frame cavity update over the simulation
+    constexpr auto dTime = 360;
+    constexpr auto nSteps = 10;
+
+    const auto solution = multiDomain.thermal().transientMultiStep(
+      HygroThermFEM::Variable::temperature, dTime, nSteps);
+
+    // The left edge cools: cavity 1 is driven across its width, from the right to the
+    // cold left; cavity 2, the wide one under the adiabatic top, ends up warmer at the
+    // bottom than at the top by more than across its width, so its heat flows up, as
+    // Conrad's direction rule reads it.
+    const auto states{multiDomain.thermal().gasCavityStates()};
+    ASSERT_EQ(2u, states.size());
+    EXPECT_EQ(KeffCavity::ScreenFlow::Left, states[0].heatFlow);
+    EXPECT_EQ(KeffCavity::ScreenFlow::Up, states[1].heatFlow);
+
+    // Both re-captured when the element started reading the cavity's conductivity live:
+    // the field then feels the cavities, their temperature differences narrow and keff
+    // settles lower than the values captured with the gas default frozen in the matrix.
+    // Re-captured again when a cavity side with no solid on it started counting as black
+    // (emissivity 1): cavity 2's top side is the model's outer edge. It used to get 0, so
+    // cavity 2 lost its radiation across the cavity; cavity 1 moves only through the field.
+    const auto correctThermalConductivity1{0.155977};
+    const auto thermalCond1 = frameCavity1.thermalConductivityMoistureAndTemperatureDependent().getCurve()[0].y;
+    EXPECT_NEAR(correctThermalConductivity1, thermalCond1, 1e-6);
+
+    // Upward flow; the original 0.025013 belonged to the horizontal evaluation a
+    // precedence slip in the direction rule produced for this cavity.
+    const auto correctThermalConductivity2{0.782487};
+    const auto thermalCond2 = frameCavity2.thermalConductivityMoistureAndTemperatureDependent().getCurve()[0].y;
+    EXPECT_NEAR(correctThermalConductivity2, thermalCond2, 1e-6);
+    EXPECT_NEAR(thermalCond2, frameCavity2.thermalConductivityDry(), 1e-12);
+}

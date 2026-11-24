@@ -1,0 +1,642 @@
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <utility>
+
+#include <KeffCavity.hxx>
+
+#include "lbnl/algorithm.hxx"
+
+#include "GasCavities.hxx"
+#include "Materials.hxx"
+#include "Nodes.hxx"
+#include "Common.hxx"
+
+namespace HygroThermFEM
+{
+    std::pair<std::size_t, std::size_t> cavitySegmentKey(const std::size_t node1,
+                                                         const std::size_t node2)
+    {
+        return {std::min(node1, node2), std::max(node1, node2)};
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////
+    ///  EquivalentGasCavity
+    ///////////////////////////////////////////////////////////////////////////////
+
+    EquivalentGasCavity::EquivalentGasCavity(
+      Nodes & nodePool,
+      const std::vector<size_t> & nodes,
+      IGas & gas,
+      const CavitySurfaceEmissivities & surfaceEmissivities,
+      const FenestrationCommon::GravityVector & gravityVector) :
+        m_Segments(buildSegments(nodePool, counterClockwise(nodePool, nodes), surfaceEmissivities)),
+        m_SideSegments(groupSegmentSides(m_Segments)),
+        m_Side{
+          {Side::Top, {0, 0}}, {Side::Bottom, {0, 0}}, {Side::Left, {0, 0}}, {Side::Right, {0, 0}}},
+        m_Area(calcArea()),
+        m_Size(calcSize(m_Area)),
+        m_Gas(gas),
+        m_GravityVector(gravityVector)
+    {
+        calcSideEmissivities();
+        updateSideTemperatures();
+    }
+
+    void EquivalentGasCavity::update()
+    {
+        updateSideTemperatures();
+        const auto hfDirection = heatFlowDirection();
+        auto side1 = getSide1(hfDirection);
+        auto side2 = getSide2(hfDirection);
+        if(const auto emissivities = m_Gas.sideEmissivities())
+        {
+            side1.emissivity = emissivities->first;
+            side2.emissivity = emissivities->second;
+        }
+        const auto evaluation{evaluate(hfDirection, side1, side2)};
+        m_Gas.updateThermalConductivity(evaluation.conductivity);
+        m_Gas.updateDiffusionResistanceFactor(evaluation.diffusionResistanceFactor);
+        m_Gas.updateSorptionCurve((side1.temperature + side2.temperature) / 2.0);
+        m_State = GasCavityState{.gasName = m_Gas.name(),
+                                 .heatFlow = hfDirection,
+                                 .side1 = side1,
+                                 .side2 = side2,
+                                 .conductivity = evaluation.conductivity,
+                                 .nusselt = evaluation.nusselt};
+    }
+
+    EquivalentGasCavity::Evaluation
+      EquivalentGasCavity::evaluate(const KeffCavity::ScreenFlow heatFlow,
+                                    const KeffCavity::CavitySide & side1,
+                                    const KeffCavity::CavitySide & side2) const
+    {
+        const auto radCalc{KeffCavity::RadiationCalculation::Simplified};
+        const auto standard = m_Gas.standard();
+        switch(standard)
+        {
+            case CavityStandard::ISO15099:
+            case CavityStandard::ISO15099Ventilated:
+            {
+                KeffCavity::CavityISO10599 cavity(
+                  heatFlow,
+                  m_Size.L,
+                  m_Size.H,
+                  m_Gas.cavityHeight(),
+                  side1,
+                  side2,
+                  m_Gas.cavityPressure(),
+                  m_GravityVector,
+                  radCalc,
+                  m_Gas.getGas(),
+                  standard == CavityStandard::ISO15099Ventilated ? KeffCavity::Ventilated::Yes
+                                                                 : KeffCavity::Ventilated::No);
+                return {.conductivity = cavity.effectiveConductivity(),
+                        .diffusionResistanceFactor = cavity.effectiveDiffusionResistanceFactor(),
+                        .nusselt = cavity.nusselt()};
+            }
+            case CavityStandard::CEN:
+            {
+                KeffCavity::CavityCEN cavity(
+                  heatFlow, m_Size.L, m_Size.H, m_Area, side1, side2, m_Gas.getGas(), radCalc);
+                return {.conductivity = cavity.effectiveConductivity(),
+                        .diffusionResistanceFactor = cavity.effectiveDiffusionResistanceFactor(),
+                        .nusselt = cavity.nusselt()};
+            }
+        }
+        return {};
+    }
+
+    const GasCavityState & EquivalentGasCavity::state() const
+    {
+        return m_State;
+    }
+
+    double EquivalentGasCavity::segmentEmissivity(const Node2D & node1,
+                                                  const Node2D & node2,
+                                                  const CavitySurfaceEmissivities & surfaceEmissivities)
+    {
+        // A segment with no wall on it opens into a neighbouring cavity. Radiation passes through
+        // it, so it counts as black, the value THERM gives Conrad for the same opening.
+        constexpr double openingEmissivity{1.0};
+        const auto wall{surfaceEmissivities.find(cavitySegmentKey(node1.getNodeNumber(), node2.getNodeNumber()))};
+        return wall != surfaceEmissivities.end() ? wall->second : openingEmissivity;
+    }
+
+    std::vector<EquivalentGasCavity::Segment>
+      EquivalentGasCavity::buildSegments(Nodes & nodePool,
+                                         const std::vector<size_t> & nodes,
+                                         const CavitySurfaceEmissivities & surfaceEmissivities)
+    {
+        std::vector<Segment> segments;
+        for(size_t i = 0u; i < nodes.size(); ++i)
+        {
+            const auto firstIndex = i == 0 ? nodes.size() - 1 : i - 1;
+            const auto & node1 = nodePool.getNode(nodes[firstIndex]);
+            const auto & node2 = nodePool.getNode(nodes[i]);
+            segments.emplace_back(node1, node2, segmentEmissivity(node1, node2, surfaceEmissivities));
+        }
+        return segments;
+    }
+
+    KeffCavity::CavitySide EquivalentGasCavity::getSide1(KeffCavity::ScreenFlow screenFlow) const
+    {
+        std::map<KeffCavity::ScreenFlow, Side> flowMap{
+          {KeffCavity::ScreenFlow::Left, Side::Right},
+          {KeffCavity::ScreenFlow::Right, Side::Left},
+          {KeffCavity::ScreenFlow::Up, Side::Bottom},
+          {KeffCavity::ScreenFlow::Down, Side::Top},
+        };
+
+        return m_Side.at(flowMap.at(screenFlow));
+    }
+
+    KeffCavity::CavitySide EquivalentGasCavity::getSide2(KeffCavity::ScreenFlow screenFlow) const
+    {
+        std::map<KeffCavity::ScreenFlow, Side> flowMap{
+          {KeffCavity::ScreenFlow::Left, Side::Left},
+          {KeffCavity::ScreenFlow::Right, Side::Right},
+          {KeffCavity::ScreenFlow::Up, Side::Top},
+          {KeffCavity::ScreenFlow::Down, Side::Bottom},
+        };
+
+        return m_Side.at(flowMap.at(screenFlow));
+    }
+
+    double EquivalentGasCavity::calcArea() const
+    {
+        double area{0};
+        for(const auto & segment : m_Segments)
+        {
+            area += segment.crossCalc();
+        }
+        return 0.5 * area;
+    }
+
+    EquivalentGasCavity::Size EquivalentGasCavity::calcSize(const double area) const
+    {
+        double maxX = m_Segments[0].firstNode().X();
+        double minX = m_Segments[0].firstNode().X();
+        double maxY = m_Segments[0].firstNode().Y();
+        double minY = m_Segments[0].firstNode().Y();
+
+        for(size_t i = 1u; i < m_Segments.size(); ++i)
+        {
+            maxX = std::max(maxX, m_Segments[i].firstNode().X());
+            minX = std::min(minX, m_Segments[i].firstNode().X());
+            maxY = std::max(maxY, m_Segments[i].firstNode().Y());
+            minY = std::min(minY, m_Segments[i].firstNode().Y());
+        }
+
+        const auto XSize = maxX - minX;
+        const auto YSize = maxY - minY;
+        const auto ratio = XSize / YSize;
+
+        const auto H = std::sqrt(area / ratio);
+        const auto L = ratio * H;
+
+        return {L, H};
+    }
+
+    std::map<EquivalentGasCavity::Side, std::vector<EquivalentGasCavity::Segment>>
+      EquivalentGasCavity::groupSegmentSides(const std::vector<Segment> & segments)
+    {
+        std::map<Side, std::vector<Segment>> result{{Side::Top, std::vector<Segment>()},
+                                                    {Side::Bottom, std::vector<Segment>()},
+                                                    {Side::Left, std::vector<Segment>()},
+                                                    {Side::Right, std::vector<Segment>()}};
+        for(const auto & segment : segments)
+        {
+            result.at(segment.side()).push_back(segment);
+        }
+        return result;
+    }
+
+    void EquivalentGasCavity::calcSideEmissivities()
+    {
+        std::map<Side, double> length{
+          {Side::Top, 0}, {Side::Bottom, 0}, {Side::Left, 0}, {Side::Right, 0}};
+        std::map<Side, double> emissLength{
+          {Side::Top, 0}, {Side::Bottom, 0}, {Side::Left, 0}, {Side::Right, 0}};
+        for(const auto & side : m_SideSegments)
+        {
+            const auto aSide = side.first;
+            for(const auto & segment : side.second)
+            {
+                length.at(aSide) += segment.length();
+                emissLength.at(aSide) += segment.length() * segment.emissivity();
+            }
+        }
+
+        for(const auto side : EnumSide())
+        {
+            if(length.at(side) != 0)
+            {
+                m_Side.at(side).emissivity = emissLength.at(side) / length.at(side);
+            }
+        }
+    }
+
+    void EquivalentGasCavity::updateSideTemperatures()
+    {
+        std::map<Side, double> length{
+          {Side::Top, 0}, {Side::Bottom, 0}, {Side::Left, 0}, {Side::Right, 0}};
+        std::map<Side, double> temperatureLength{
+          {Side::Top, 0}, {Side::Bottom, 0}, {Side::Left, 0}, {Side::Right, 0}};
+        for(const auto & side : m_SideSegments)
+        {
+            const auto aSide = side.first;
+            for(const auto & segment : side.second)
+            {
+                length.at(aSide) += segment.length();
+                temperatureLength.at(aSide) += segment.length() * celsiusToKelvin(segment.temperature());
+            }
+        }
+
+        for(const auto side : EnumSide())
+        {
+            if(length.at(side) != 0)
+            {
+                m_Side.at(side).temperature = temperatureLength.at(side) / length.at(side);
+            }
+        }
+        fillEmptySides(length);
+    }
+
+    std::vector<size_t> EquivalentGasCavity::counterClockwise(Nodes & nodePool,
+                                                              const std::vector<size_t> & nodes)
+    {
+        double twiceArea{0.0};
+        for(size_t position = 0u; position < nodes.size(); ++position)
+        {
+            const auto & first = nodePool.getNode(nodes[position]);
+            const auto & second = nodePool.getNode(nodes[(position + 1u) % nodes.size()]);
+            twiceArea += first.X() * second.Y() - first.Y() * second.X();
+        }
+        if(twiceArea >= 0.0)
+        {
+            return nodes;
+        }
+        return {nodes.rbegin(), nodes.rend()};
+    }
+
+    EquivalentGasCavity::ExtremeNodes EquivalentGasCavity::extremeNodes() const
+    {
+        ExtremeNodes extreme;
+        for(const auto & segment : m_Segments)
+        {
+            const auto & node = segment.firstNode();
+            if(extreme.minX == nullptr || node.X() < extreme.minX->X())
+            {
+                extreme.minX = &node;
+            }
+            if(extreme.maxX == nullptr || node.X() > extreme.maxX->X())
+            {
+                extreme.maxX = &node;
+            }
+            if(extreme.minY == nullptr || node.Y() < extreme.minY->Y())
+            {
+                extreme.minY = &node;
+            }
+            if(extreme.maxY == nullptr || node.Y() > extreme.maxY->Y())
+            {
+                extreme.maxY = &node;
+            }
+        }
+        return extreme;
+    }
+
+    void EquivalentGasCavity::fillEmptySides(const std::map<Side, double> & lengths)
+    {
+        const auto extreme{extremeNodes()};
+        if(extreme.minX == nullptr)
+        {
+            return;
+        }
+        struct Fallback
+        {
+            const Node2D * node;
+            Side neighbour1;
+            Side neighbour2;
+        };
+        const std::map<Side, Fallback> rule{{Side::Left, {extreme.minX, Side::Top, Side::Bottom}},
+                                            {Side::Right, {extreme.maxX, Side::Top, Side::Bottom}},
+                                            {Side::Bottom, {extreme.minY, Side::Left, Side::Right}},
+                                            {Side::Top, {extreme.maxY, Side::Left, Side::Right}}};
+        for(const auto & [side, fallback] : rule)
+        {
+            if(lengths.at(side) == 0.0)
+            {
+                m_Side.at(side).temperature =
+                  celsiusToKelvin(fallback.node->property(Variable::temperature));
+                m_Side.at(side).emissivity = 0.5
+                                             * (m_Side.at(fallback.neighbour1).emissivity
+                                                + m_Side.at(fallback.neighbour2).emissivity);
+            }
+        }
+    }
+
+    KeffCavity::ScreenFlow EquivalentGasCavity::heatFlowDirection() const
+    {
+        const auto leftTemp = m_Side.at(Side::Left).temperature;
+        const auto rightTemp = m_Side.at(Side::Right).temperature;
+        const auto topTemp = m_Side.at(Side::Top).temperature;
+        const auto bottomTemp = m_Side.at(Side::Bottom).temperature;
+        if(std::abs(leftTemp - rightTemp) > std::abs(bottomTemp - topTemp))
+        {
+            return leftTemp > rightTemp ? KeffCavity::ScreenFlow::Right : KeffCavity::ScreenFlow::Left;
+        }
+        if(bottomTemp > topTemp)
+        {
+            return KeffCavity::ScreenFlow::Up;
+        }
+        if(topTemp > bottomTemp)
+        {
+            return KeffCavity::ScreenFlow::Down;
+        }
+        return KeffCavity::ScreenFlow::Right;
+    }
+
+    void
+      EquivalentGasCavity::setGravityVector(const FenestrationCommon::GravityVector & gravityVector)
+    {
+        m_GravityVector = gravityVector;
+        calcSideEmissivities();
+        updateSideTemperatures();
+    }
+
+    EquivalentGasCavity::Segment::Segment(const Node2D & node1,
+                                          const Node2D & node2,
+                                          double emissivity) :
+        node1(node1),
+        node2(node2),
+        m_Emissivity(emissivity),
+        m_Length(
+          std::sqrt(std::pow(node1.X() - node2.X(), 2) + std::pow(node1.Y() - node2.Y(), 2))),
+        m_Side(calcSide(node1, node2))
+    {}
+
+    EquivalentGasCavity::Side EquivalentGasCavity::Segment::calcSide(const Node2D & n1,
+                                                                     const Node2D & n2) const
+    {
+        const auto PI = 4 * std::atan(1);
+        const auto angle = std::atan2((n2.Y() - n1.Y()), (n2.X() - n1.X()));
+        Side aSide{Side::Left};
+        const auto sectorAngle{PI / 4};
+        // TODO: This is processing for counter clock wise. Need mechanism that will catch clockwise
+        // direction as well
+        if(angle < sectorAngle && angle > -sectorAngle)
+        {
+            aSide = Side::Bottom;
+        }
+        else if(angle >= sectorAngle && angle < 3 * sectorAngle)
+        {
+            aSide = Side::Right;
+        }
+        else if(angle < -sectorAngle && angle > -3 * sectorAngle)
+        {
+            aSide = Side::Left;
+        }
+        else if((angle > 3 * sectorAngle || angle <= -3 * sectorAngle))
+        {
+            aSide = Side::Top;
+        }
+        return aSide;
+    }
+
+    double EquivalentGasCavity::Segment::emissivity() const
+    {
+        return m_Emissivity;
+    }
+
+    double EquivalentGasCavity::Segment::length() const
+    {
+        return m_Length;
+    }
+
+    double EquivalentGasCavity::Segment::temperature() const
+    {
+        return 0.5
+               * (node1.property(Variable::temperature) + node2.property(Variable::temperature));
+    }
+
+    double EquivalentGasCavity::Segment::crossCalc() const
+    {
+        return node1.X() * node2.Y() - node1.Y() * node2.X();
+    }
+
+    const Node2D & EquivalentGasCavity::Segment::firstNode() const
+    {
+        return node1;
+    }
+
+    const EquivalentGasCavity::Side & EquivalentGasCavity::Segment::side() const
+    {
+        return m_Side;
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////
+    ///  EquivalentGasCavities
+    ///////////////////////////////////////////////////////////////////////////////
+
+    EquivalentGasCavities::EquivalentGasCavities(Nodes & nodePool,
+                                                 Materials & materialPool,
+                                                 const ElementsLinear2D & elements,
+                                                 CavitySurfaceEmissivities surfaceEmissivities) :
+        m_NodePool(nodePool),
+        m_MaterialPool(materialPool),
+        m_Elements(elements),
+        m_SurfaceEmissivities(std::move(surfaceEmissivities))
+    {
+        createEquivalentFrameCavities();
+    }
+
+    CavitySurfaceEmissivities EquivalentGasCavities::wallEmissivities() const
+    {
+        const auto gases{m_MaterialPool.getGases()};
+        CavitySurfaceEmissivities walls;
+        for(const auto & element : m_Elements.elements())
+        {
+            const auto & material{element->getMaterial()};
+            if(lbnl::contains(gases, material.name()))
+            {
+                continue;
+            }
+            const double emissivity{material.hasEmissivity() ? material.emissivity() : 0.0};
+            const auto nodes{element->nodeIndexes()};
+            for(std::size_t index = 0u; index < nodes.size(); ++index)
+            {
+                const auto next{nodes[(index + 1u) % nodes.size()]};
+                if(nodes[index] != next)
+                {
+                    walls[cavitySegmentKey(nodes[index], next)] = emissivity;
+                }
+            }
+        }
+        for(const auto & [segment, emissivity] : m_SurfaceEmissivities)
+        {
+            walls[segment] = emissivity;
+        }
+        return walls;
+    }
+
+    void EquivalentGasCavities::createEquivalentFrameCavities()
+    {
+        const auto walls{wallEmissivities()};
+        auto frameCavities = m_MaterialPool.getGases();
+
+        for(const auto & frameCavity : frameCavities)
+        {
+            std::vector<std::vector<size_t>> elementNodes;
+            for(const auto & element : m_Elements.elements())
+            {
+                if(element->getMaterial().name() == frameCavity)
+                {
+                    elementNodes.push_back(element->nodeIndexes());
+                }
+            }
+            auto & gas = m_MaterialPool.gas(frameCavity);
+            m_Cavities.emplace_back(
+              m_NodePool, edgeNodesOrdered(getEdges(elementNodes), frameCavity), gas, walls);
+        }
+    }
+
+    std::set<EquivalentGasCavities::line>
+      EquivalentGasCavities::getEdges(const std::vector<std::vector<size_t>> & elNodes)
+    {
+        std::map<std::set<size_t>, size_t> edges;
+        std::set<line> allEdges;
+
+        for(auto & n : elNodes)
+        {
+            for(size_t i = 0u; i < n.size(); ++i)
+            {
+                const auto index1 = n[i];
+                auto index2 = n[0u];
+                if(i != n.size() - 1)
+                {
+                    index2 = n[i + 1u];
+                }
+                std::set<size_t> edge({index1, index2});
+                if(edges.find(edge) != edges.end())
+                {
+                    edges[edge]++;
+                    allEdges.erase(line(index1, index2));
+                    allEdges.erase(line(index2, index1));
+                }
+                else
+                {
+                    edges[edge] = 1u;
+                    if(index1 != index2)
+                    {
+                        allEdges.insert(line(index1, index2));
+                    }
+                }
+            }
+        }
+
+        return allEdges;
+    }
+
+    std::vector<size_t> EquivalentGasCavities::edgeNodesOrdered(std::set<line> allEdges,
+                                                                const std::string & cavityName)
+    {
+        const auto notOneOutline = [&cavityName] {
+            return std::runtime_error("Frame cavity \"" + cavityName
+                                      + "\" does not form one closed outline in the mesh");
+        };
+
+        if(allEdges.empty())
+        {
+            throw notOneOutline();
+        }
+
+        std::vector<size_t> boundaryLine;
+
+        line first = *allEdges.begin();
+        boundaryLine.push_back(first.getN1());
+        allEdges.erase(first);
+
+        while(!allEdges.empty())
+        {
+            const auto second =
+              std::find_if(allEdges.begin(), allEdges.end(), [&first](const line & candidate) {
+                  return first.getN2() == candidate.getN1();
+              });
+            if(second == allEdges.end())
+            {
+                throw notOneOutline();
+            }
+            first = *second;
+            boundaryLine.push_back(first.getN1());
+            allEdges.erase(first);
+        }
+
+        return boundaryLine;
+    }
+
+    void EquivalentGasCavities::update()
+    {
+        for(auto & cavity : m_Cavities)
+        {
+            cavity.update();
+        }
+    }
+
+    std::vector<GasCavityState> EquivalentGasCavities::states() const
+    {
+        std::vector<GasCavityState> result;
+        result.reserve(m_Cavities.size());
+        for(const auto & cavity : m_Cavities)
+        {
+            result.push_back(cavity.state());
+        }
+        return result;
+    }
+
+    void EquivalentGasCavities::setGravityVector(
+      const FenestrationCommon::GravityVector & gravityVector)
+    {
+        for(auto & cavity : m_Cavities)
+        {
+            cavity.setGravityVector(gravityVector);
+        }
+    }
+
+    EquivalentGasCavities::line::line(const size_t n1, const size_t n2) : n1(n1), n2(n2)
+    {}
+
+    size_t EquivalentGasCavities::line::getN1() const
+    {
+        return n1;
+    }
+
+    size_t EquivalentGasCavities::line::getN2() const
+    {
+        return n2;
+    }
+
+    bool EquivalentGasCavities::line::operator<(const line & rhs) const
+    {
+        if(n1 < rhs.n1)
+            return true;
+        if(rhs.n1 < n1)
+            return false;
+        return n2 < rhs.n2;
+    }
+
+    bool EquivalentGasCavities::line::operator>(const line & rhs) const
+    {
+        return rhs < *this;
+    }
+
+    bool EquivalentGasCavities::line::operator<=(const line & rhs) const
+    {
+        return !(rhs < *this);
+    }
+
+    bool EquivalentGasCavities::line::operator>=(const line & rhs) const
+    {
+        return !(*this < rhs);
+    }
+}   // namespace HygroThermFEM

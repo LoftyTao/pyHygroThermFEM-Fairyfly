@@ -1,0 +1,163 @@
+#include <memory>
+#include <stdexcept>
+#include <gtest/gtest.h>
+
+#include <memory>
+
+#include "HygroThermFEM2D.hxx"
+
+TEST( TestQuadLinearElementLocal2D, TestIntegrationPoint1 ) {
+    SCOPED_TRACE( "Begin Test: Quadrilateral linear element 2D in local coordinates." );
+
+    auto & aElement = HygroThermFEM::QuadrilateralLinearLocal2D::Instance();
+
+    // Integration point 1
+    constexpr auto IntegrationPoint = 0;
+
+    // Psi
+    std::vector< double > correctPsi = { 0.622008468, 0.166666667, 0.044658199, 0.166666667 };
+    auto psi = aElement.Psi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsi.size(), psi.size() );
+
+    for ( size_t i = 0u; i < correctPsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsi[ i ], psi[ i ], 1e-6 );
+    }
+
+    // PsiDKsi
+    std::vector< double > correctPsiDKsi = { -0.394337567, 0.394337567, 0.105662433, -0.105662433 };
+    auto psiDKsi = aElement.PsiDKsi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDKsi.size(), psiDKsi.size() );
+
+    for ( size_t i = 0u; i < correctPsiDKsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDKsi[ i ], psiDKsi[ i ], 1e-6 );
+    }
+
+    // PsiDEta
+    std::vector< double > correctPsiDEta = { -0.394337567, -0.105662433, 0.105662433, 0.394337567 };
+    auto psiDEta = aElement.PsiDEta( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDEta.size(), psiDEta.size() );
+
+    for ( size_t i = 0u; i < correctPsiDEta.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDEta[ i ], psiDEta[ i ], 1e-6 );
+    }
+}
+
+TEST( TestQuadLinearElementLocal2D, TestIntegrationPoint2 ) {
+    SCOPED_TRACE( "Begin Test: Quadrilateral linear element 2D in local coordinates." );
+
+    auto & aElement = HygroThermFEM::QuadrilateralLinearLocal2D::Instance();
+
+    // Integration point 2
+    constexpr auto IntegrationPoint = 1;
+
+    // Psi
+    std::vector< double > correctPsi = { 0.166666667, 0.622008468, 0.166666667, 0.044658199 };
+    auto psi = aElement.Psi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsi.size(), psi.size() );
+
+    for ( auto i = 0u; i < correctPsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsi[ i ], psi[ i ], 1e-6 );
+    }
+
+    // PsiDKsi
+    std::vector< double > correctPsiDKsi = { -0.394337567, 0.394337567, 0.105662433, -0.105662433 };
+    auto psiDKsi = aElement.PsiDKsi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDKsi.size(), psiDKsi.size() );
+
+    for ( auto i = 0u; i < correctPsiDKsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDKsi[ i ], psiDKsi[ i ], 1e-6 );
+    }
+
+    // PsiDEta
+    std::vector< double > correctPsiDEta = { -0.105662433, -0.394337567, 0.394337567, 0.105662433 };
+    auto PsiDEta = aElement.PsiDEta( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDEta.size(), PsiDEta.size() );
+
+    for ( auto i = 0u; i < correctPsiDEta.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDEta[ i ], PsiDEta[ i ], 1e-6 );
+    }
+}
+
+TEST( TestQuadLinearElementLocal2D, TestIntegrationPoint3 ) {
+    SCOPED_TRACE( "Begin Test: Quadrilateral linear element 2D in local coordinates." );
+
+    auto & aElement = HygroThermFEM::QuadrilateralLinearLocal2D::Instance();
+
+    // Integration point 3
+    constexpr auto IntegrationPoint = 2;
+
+    // Psi
+    std::vector< double > correctPsi = { 0.044658199, 0.166666667, 0.622008468, 0.166666667 };
+    auto psi = aElement.Psi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsi.size(), psi.size() );
+
+    for ( auto i = 0u; i < correctPsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsi[ i ], psi[ i ], 1e-6 );
+    }
+
+    // PsiDKsi
+    std::vector< double > correctPsiDKsi = { -0.105662433, 0.105662433, 0.394337567, -0.394337567 };
+    auto psiDKsi = aElement.PsiDKsi( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDKsi.size(), psiDKsi.size() );
+
+    for ( auto i = 0u; i < correctPsiDKsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDKsi[ i ], psiDKsi[ i ], 1e-6 );
+    }
+
+    // PsiDEta
+    std::vector< double > correctPsiDEta = { -0.105662433, -0.394337567, 0.394337567, 0.105662433 };
+    auto psiDEta = aElement.PsiDEta( IntegrationPoint );
+
+    EXPECT_EQ( correctPsiDEta.size(), psiDEta.size() );
+
+    for ( auto i = 0u; i < correctPsiDEta.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDEta[ i ], psiDEta[ i ], 1e-6 );
+    }
+}
+
+TEST( TestQuadLinearElementLocal2D, TestIntegrationPoint4 ) {
+    SCOPED_TRACE( "Begin Test: Quadrilateral linear element 2D in local coordinates." );
+
+    auto & aElement = HygroThermFEM::QuadrilateralLinearLocal2D::Instance();
+
+    // Integration point 4
+    constexpr auto integrationPoint = 3;
+
+    // Psi
+    std::vector< double > correctPsi = { 0.166666667, 0.044658199, 0.166666667, 0.622008468 };
+    auto psi = aElement.Psi( integrationPoint );
+
+    EXPECT_EQ( correctPsi.size(), psi.size() );
+
+    for ( auto i = 0u; i < correctPsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsi[ i ], psi[ i ], 1e-6 );
+    }
+
+    // PsiDKsi
+    std::vector< double > correctPsiDKsi = { -0.105662433, 0.105662433, 0.394337567, -0.394337567 };
+    auto psiDKsi = aElement.PsiDKsi( integrationPoint );
+
+    EXPECT_EQ( correctPsiDKsi.size(), psiDKsi.size() );
+
+    for ( auto i = 0u; i < correctPsiDKsi.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDKsi[ i ], psiDKsi[ i ], 1e-6 );
+    }
+
+    // PsiDEta
+    std::vector< double > correctPsiDEta = { -0.394337567, -0.105662433, 0.105662433, 0.394337567 };
+    auto psiDEta = aElement.PsiDEta( integrationPoint );
+
+    EXPECT_EQ( correctPsiDEta.size(), psiDEta.size() );
+
+    for ( auto i = 0u; i < correctPsiDEta.size(); ++i ) {
+        EXPECT_NEAR( correctPsiDEta[ i ], psiDEta[ i ], 1e-6 );
+    }
+}

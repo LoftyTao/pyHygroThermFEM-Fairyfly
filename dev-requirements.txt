@@ -1,0 +1,6 @@
+-r requirements.txt
+build
+pytest
+pybind11
+fairyfly-core>=0.2.49
+# Optional: install fairyfly-next-therm to run THMZResult integration tests.

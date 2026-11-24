@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+build/
+dist/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.pyd
+*.so
+pyhygrothermfem_fairyfly/_build_source.json
+_source_freeze.json

@@ -1,0 +1,718 @@
+#include <algorithm>
+#include <utility>
+#include <vector>
+#include <stdexcept>
+
+#include "Functions.hxx"
+#include "Node2D.hxx"
+#include "Material.hxx"
+#include "Common.hxx"
+
+namespace
+{
+    //! Finds the two bracketing points around iterator position for interpolation.
+    //! Shared by TabularDerivativeSmooth and LiquidTransportationCurve.
+    std::pair<FenestrationCommon::point, FenestrationCommon::point>
+      bracketingPoints(std::vector<FenestrationCommon::point>::const_iterator & iter,
+                       const std::vector<FenestrationCommon::point> & table)
+    {
+        const auto pt2 = iter == table.end() ? *std::prev(table.end()) : *iter;
+        if(iter != table.begin())
+        {
+            --iter;
+        }
+        const auto pt1 = *iter;
+        return std::make_pair(pt1, pt2);
+    }
+
+    //! Computes midpoint derivative curve from a table of (x, y) points.
+    //! Used by both TabularDerivativeSmooth constructors.
+    std::vector<FenestrationCommon::point>
+      computeDerivativeCurve(const std::vector<FenestrationCommon::point> & values)
+    {
+        std::vector<FenestrationCommon::point> curve;
+        curve.reserve(values.size() - 1);
+        for(size_t idx = 1u; idx < values.size(); ++idx)
+        {
+            const auto xLo = values[idx - 1].x;
+            const auto xHi = values[idx].x;
+            const auto yLo = values[idx - 1].y;
+            const auto yHi = values[idx].y;
+            curve.emplace_back((xLo + xHi) / 2.0, (yHi - yLo) / (xHi - xLo));
+        }
+        return curve;
+    }
+}   // anonymous namespace
+
+namespace HygroThermFEM
+{
+    double vaporPressureAtTemperature(const double t_temperature)
+    {
+        const auto temperature = t_temperature + 273.15;
+        return std::exp(77.345 + 0.0057 * temperature - 7235.0 / temperature)
+               / std::pow(temperature, 8.2);
+    }
+
+    double saturationConcentrationAtTemperature(const double t_temperature)
+    {
+        // RT/M for water vapor
+        constexpr auto gasConstantForWaterVapor = 461.4;
+        return vaporPressureAtTemperature(t_temperature)
+               / ((t_temperature + 273.15) * gasConstantForWaterVapor);
+    }
+
+    double saturationConcentrationDerivativeAtTemperature(const double t_temperature)
+    {
+        // c_sat(T) = exp(77.345 + 0.0057 T - 7235 / T) / (R_v T^9.2) with T in Kelvin, so
+        // d(ln c_sat)/dT = 0.0057 + 7235 / T^2 - 9.2 / T and the derivative is that
+        // logarithmic factor times c_sat itself -- one curve evaluation instead of the
+        // two a central finite difference needs, and exact.
+        const auto temperature = t_temperature + 273.15;
+        const auto logDerivative =
+          0.0057 + 7235.0 / (temperature * temperature) - 9.2 / temperature;
+        return saturationConcentrationAtTemperature(t_temperature) * logDerivative;
+    }
+
+    double heatOfEvaporation(const double temperature)
+    {
+        return (2500.8 - 2.36 * temperature + 0.016 * std::pow(temperature, 2)
+                - 0.00006 * std::pow(temperature, 3))
+               * 1000;
+    }
+
+    double vaporDiffusionCoefficientAtTemperature(const double temperature)
+    {
+        return (22.2 + 0.14 * temperature) * 1e-6;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  IValue
+    //////////////////////////////////////////////////////////////////
+
+    NodalValues IValue::values(const INodes & nodes) const
+    {
+        NodalValues result(nodes.size());
+        for(size_t idx = 0u; idx < nodes.size(); ++idx)
+        {
+            result[idx] = value(nodes[idx]);
+        }
+        return result;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  IFunction
+    //////////////////////////////////////////////////////////////////
+
+    IFunction::IFunction(const Variable t_Property) : m_Property(t_Property)
+    {}
+
+    double IFunction::value(const INode2D & node) const
+    {
+        return evaluateFunction(node.property(m_Property));
+    }
+
+    double IFunction::valueWithPreviousTimestep(const INode2D & node) const
+    {
+        return evaluateFunction(node.property(m_Property),
+                                node.property(m_Property, Timestep::Previous));
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  Constant
+    //////////////////////////////////////////////////////////////////
+
+    Constant::Constant(const double value) : IFunction(Variable::temperature), m_Value(value)
+    {}
+
+    double Constant::value(const INode2D &) const
+    {
+        return m_Value;
+    }
+
+    double Constant::evaluateFunction(const double, const double) const
+    {
+        return m_Value;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  State value
+    //////////////////////////////////////////////////////////////////
+
+    StateValue::StateValue(Variable property) : IFunction(property)
+    {}
+
+    double StateValue::evaluateFunction(const double t_position, const double) const
+    {
+        return t_position;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  TabularFunction1D
+    //////////////////////////////////////////////////////////////////
+
+    TabularFunction1D::TabularFunction1D(const std::vector<FenestrationCommon::point> & values,
+                                         Variable property,
+                                         FenestrationCommon::Interpolator interpolator) :
+        IFunction(property),
+        m_Curve(values),
+        m_Interpolator(std::move(interpolator))
+    {
+        checkIfCurveIsSinglePoint();
+    }
+
+    TabularFunction1D::TabularFunction1D(
+      const std::initializer_list<FenestrationCommon::point> & list,
+      const Variable property,
+      FenestrationCommon::Interpolator interpolator) :
+        IFunction(property),
+        m_Curve(list),
+        m_Interpolator(std::move(interpolator))
+    {
+        checkIfCurveIsSinglePoint();
+    }
+
+
+    double TabularFunction1D::evaluateFunction(const double t_position, const double) const
+    {
+        auto it =
+          std::find_if(m_Curve.begin(), m_Curve.end(), [&](const FenestrationCommon::point & val) {
+              return val.x > t_position;
+          });
+
+        const auto points = getInterpolationPoints(it, m_Curve);
+
+        return m_Interpolator.interpolate(points.first, points.second, t_position);
+    }
+
+    std::pair<FenestrationCommon::point, FenestrationCommon::point>
+      TabularFunction1D::getInterpolationPoints(
+          std::vector<FenestrationCommon::point>::const_iterator & it,
+          const std::vector<FenestrationCommon::point> & table) const
+    {
+        if(it == table.end())
+        {
+            --it;
+        }
+        const auto pt2 = *it;
+        if(table.size() != 1) {
+            if (it != table.begin()) {
+                --it;
+            } else {
+                ++it;
+            }
+        }
+
+        const auto pt1 = *it;
+
+        return std::make_pair(pt1, pt2);
+    }
+
+    double TabularFunction1D::at(const double position) const
+    {
+        return evaluateFunction(position, position);
+    }
+
+    double TabularFunction1D::maxX() const
+    {
+        return m_Curve.back().x;
+    }
+
+    double TabularFunction1D::maxY() const
+    {
+        return m_Curve.back().y;
+    }
+
+    double TabularFunction1D::minX() const
+    {
+        return m_Curve.front().x;
+    }
+
+    double TabularFunction1D::minY() const
+    {
+        return m_Curve.front().y;
+    }
+
+    std::vector<FenestrationCommon::point> & TabularFunction1D::getCurve()
+    {
+        return m_Curve;
+    }
+
+    const std::vector<FenestrationCommon::point> & TabularFunction1D::getCurve() const
+    {
+        return m_Curve;
+    }
+
+    void TabularFunction1D::checkIfCurveIsSinglePoint()
+    {
+        if(m_Curve.size() == 1u)
+        {
+            m_Curve.emplace_back(m_Curve[0]);
+        }
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  TabularFunction2D
+    //////////////////////////////////////////////////////////////////
+
+    TabularFunction2D::TabularFunction2D(
+      const std::vector<FenestrationCommon::point> & firstValues,
+      double firstTableMeasuredAt,
+      Variable firstProperty,
+      const std::vector<FenestrationCommon::point> & secondValues,
+      double secondTableMeasureAt,
+      Variable secondProperty,
+      const FenestrationCommon::Interpolator & interpolator) :
+        TabularFunction1D(secondValues, secondProperty, interpolator),
+        m_FirstTable(firstValues, firstProperty, interpolator),
+        m_FirstProperty(firstProperty)
+    {
+        const double tolerance{1e-6};
+        const double y1{findValueAtPoint(firstValues, secondTableMeasureAt)};
+        const double y2{findValueAtPoint(secondValues, firstTableMeasuredAt)};
+        if(std::abs(y1 - y2) < tolerance)
+        {
+            m_CommonValueAtMeasuredTables = y1;
+        }
+        else
+        {
+            throw std::runtime_error("Values in two tables do not correspond to each other. Both "
+                                     "tables must return same value at measured points.");
+        }
+    }
+
+    void TabularFunction2D::bindMaterial(const IMaterial & material)
+    {
+        m_Material = &material;
+    }
+
+    double TabularFunction2D::firstTableValue(const INode2D & node) const
+    {
+        if(m_Material != nullptr && m_FirstProperty == Variable::water)
+        {
+            return m_FirstTable.at(m_Material->waterContent(node).content(WaterContent::Water));
+        }
+        return m_FirstTable.value(node);
+    }
+
+    double TabularFunction2D::value(const INode2D & node) const
+    {
+        const auto value1 = firstTableValue(node);
+        const auto value2 = TabularFunction1D::value(node);
+        // This is simplified version of following result = m_CommonValueAtMeasuredTables + (value1
+        // - m_CommonValueAtMeasuredTables) + (value2 - m_CommonValueAtMeasuredTables)
+        return -m_CommonValueAtMeasuredTables + value1 + value2;
+    }
+
+    double TabularFunction2D::maxXFirstTable() const
+    {
+        return m_FirstTable.maxX();
+    }
+
+    double TabularFunction2D::maxYFirstTable() const
+    {
+        return m_FirstTable.maxY();
+    }
+
+    const std::vector<FenestrationCommon::point> & TabularFunction2D::firstTable() const
+    {
+        return m_FirstTable.getCurve();
+    }
+
+    double TabularFunction2D::findValueAtPoint(const std::vector<FenestrationCommon::point> & table,
+                                               const double value) const
+    {
+        auto it =
+          std::find_if(table.begin(), table.end(), [&](const FenestrationCommon::point & val) {
+              return val.x > value;
+          });
+
+        const auto points = getInterpolationPoints(it, table);
+
+        return m_Interpolator.interpolate(points.first, points.second, value);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  TabularDerivative
+    //////////////////////////////////////////////////////////////////
+
+    TabularDerivative::TabularDerivative(std::vector<FenestrationCommon::point> values,
+                                         Variable property) :
+        IFunction(property),
+        m_Curve(std::move(values))
+    {}
+
+    TabularDerivative::TabularDerivative(
+      const std::initializer_list<FenestrationCommon::point> & list, const Variable property) :
+        IFunction(property),
+        m_Curve(list)
+    {}
+
+    double TabularDerivative::evaluateFunction(const double t_position, const double) const
+    {
+        auto it = std::find_if(m_Curve.begin(), m_Curve.end(), [&](FenestrationCommon::point val) {
+            return val.x > t_position;
+        });
+        const auto points = getInterpolationPoints(it, m_Curve);
+
+        return (points.second.y - points.first.y) / (points.second.x - points.first.x);
+    }
+
+    std::pair<FenestrationCommon::point, FenestrationCommon::point>
+      TabularDerivative::getInterpolationPoints(
+          std::vector<FenestrationCommon::point>::const_iterator & it,
+          const std::vector<FenestrationCommon::point> & table) const
+    {
+        if(it == table.begin())
+        {
+            ++it;
+        }
+        auto pt2 = it == table.end() ? table.back() : *it;
+        if(it != table.begin())
+        {
+            --it;
+        }
+        if(*it == table.back())
+        {
+            --it;
+        }
+        auto pt1 = it == table.begin() ? table.front() : *it;
+
+        return std::make_pair(pt1, pt2);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  TabularDerivativeSmooth
+    //////////////////////////////////////////////////////////////////
+
+    TabularDerivativeSmooth::TabularDerivativeSmooth(
+      const std::vector<FenestrationCommon::point> & values, Variable property) :
+        IFunction(property),
+        m_Curve(computeDerivativeCurve(values))
+    {}
+
+    TabularDerivativeSmooth::TabularDerivativeSmooth(
+      const std::initializer_list<FenestrationCommon::point> & list, Variable property) :
+        IFunction(property),
+        m_Curve(computeDerivativeCurve(list))
+    {}
+
+    double TabularDerivativeSmooth::evaluateFunction(const double t_position, const double) const
+    {
+        auto it = std::find_if(m_Curve.begin(), m_Curve.end(), [&](FenestrationCommon::point val) {
+            return val.x > t_position;
+        });
+        const auto points = getInterpolationPoints(it, m_Curve);
+
+        const auto dy = points.second.y - points.first.y;
+        const auto dx = points.second.x - points.first.x;
+
+        auto result = points.first.y;
+        if(dx != 0)
+        {
+            result += dy / dx * (t_position - points.first.x);
+        }
+
+        return result;
+    }
+
+    std::pair<FenestrationCommon::point, FenestrationCommon::point>
+      TabularDerivativeSmooth::getInterpolationPoints(
+          std::vector<FenestrationCommon::point>::const_iterator & iter,
+          const std::vector<FenestrationCommon::point> & table) const
+    {
+        return bracketingPoints(iter, table);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  SorptionSecantCapacity
+    //////////////////////////////////////////////////////////////////
+
+    SorptionSecantCapacity::SorptionSecantCapacity(
+      const std::vector<FenestrationCommon::point> & sorptionCurve, const Variable property) :
+        TabularFunction1D(sorptionCurve, property)
+    {}
+
+    double SorptionSecantCapacity::value(const INode2D & node) const
+    {
+        return valueWithPreviousTimestep(node);
+    }
+
+    double SorptionSecantCapacity::evaluateFunction(const double t_position,
+                                                    const double t_previousTimestep) const
+    {
+        // w(phi): the sorption curve, via the base class' linear interpolation.
+        const auto w = [this](const double phi) {
+            return TabularFunction1D::evaluateFunction(phi, phi);
+        };
+
+        const double dphi = t_position - t_previousTimestep;
+        constexpr double minDelta = 1e-12;
+        if(std::abs(dphi) > minDelta)
+        {
+            // Secant slope over the step -> mass-conservative capacity.
+            return (w(t_position) - w(t_previousTimestep)) / dphi;
+        }
+
+        // Secant undefined (no change since previous timestep): finite-difference tangent.
+        constexpr double h = 1e-6;
+        return (w(t_position + h) - w(t_position - h)) / (2.0 * h);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  SuctionFunction
+    //////////////////////////////////////////////////////////////////
+
+    namespace
+    {
+        //! Physically negligible liquid diffusivity used in place of exact-zero table
+        //! values so the logarithmic (geometric) interpolation stays continuous.
+        //!
+        //! Geometric interpolation against an exact-zero anchor is identically zero across
+        //! the whole segment and then JUMPS to the next table value at the segment end
+        //! (pow(0, 1-f) = 0 for every f < 1) -- a step discontinuity in the coefficient,
+        //! exactly where near-saturation cases iterate. With the floor, D_l decays
+        //! continuously and steeply toward the anchor instead (for Cottaer: ~1e-13 m^2/s
+        //! at w = 10 versus 1e-8 at the first measured point w = 27), which keeps liquid
+        //! transport physically negligible below the first measured point without the
+        //! cliff.
+        constexpr double minLiquidDiffusivity = 1e-15;
+
+        std::vector<FenestrationCommon::point>
+          floorZeroValues(const std::vector<FenestrationCommon::point> & values)
+        {
+            std::vector<FenestrationCommon::point> floored;
+            floored.reserve(values.size());
+            for(const auto & pt : values)
+            {
+                floored.emplace_back(pt.x, (std::max)(pt.y, minLiquidDiffusivity));
+            }
+            return floored;
+        }
+    }   // anonymous namespace
+
+    LiquidTransportationCurve::LiquidTransportationCurve(
+      const std::vector<FenestrationCommon::point> & vec, const IMaterial & material) :
+        TabularFunction1D(floorZeroValues(vec),
+                          Variable::water,
+                          FenestrationCommon::Interpolation::Logarithmic),
+        m_Material(material)
+    {}
+
+    LiquidTransportationCurve::LiquidTransportationCurve(
+      const std::initializer_list<FenestrationCommon::point> & list, const IMaterial & material) :
+        TabularFunction1D(floorZeroValues(list),
+                          Variable::water,
+                          FenestrationCommon::Interpolation::Logarithmic),
+        m_Material(material)
+    {}
+
+    double LiquidTransportationCurve::value(const INode2D & node) const
+    {
+        // Resolve `w` through the bound material instead of through the node's
+        // averaged `Variable::water` property. At a material interface the node's
+        // averaged water content is not consistent with this material's curve at
+        // the node's humidity, which produces a non-uniform per-element coefficient
+        // and breaks the property `K * U_uniform = 0` of the assembled stiffness.
+        // See class comment in Functions.hxx for the full reasoning.
+        const double materialWater =
+          m_Material.waterContent(node).content(WaterContent::Water);
+        return evaluateFunction(materialWater, materialWater);
+    }
+
+    std::pair<FenestrationCommon::point, FenestrationCommon::point>
+      LiquidTransportationCurve::getInterpolationPoints(
+          std::vector<FenestrationCommon::point>::const_iterator & iter,
+          const std::vector<FenestrationCommon::point> & table) const
+    {
+        return bracketingPoints(iter, table);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  SaturationFunction
+    //////////////////////////////////////////////////////////////////
+
+    SaturationFunction::SaturationFunction() : IFunction(Variable::temperature)
+    {}
+
+    double SaturationFunction::evaluateFunction(const double t_position, const double) const
+    {
+        return saturationConcentrationAtTemperature(t_position);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  SaturationDerivative
+    //////////////////////////////////////////////////////////////////
+
+    SaturationDerivative::SaturationDerivative() : IFunction(Variable::temperature)
+    {}
+
+    double SaturationDerivative::evaluateFunction(const double t_position, const double) const
+    {
+        return saturationConcentrationDerivativeAtTemperature(t_position);
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  VaporPermeability
+    //////////////////////////////////////////////////////////////////
+
+    ResistanceFactorCurve::ResistanceFactorCurve(
+      const std::vector<FenestrationCommon::point> & curve) :
+        TabularFunction1D(curve, Variable::water)
+    {}
+
+    double ResistanceFactorCurve::at(const double waterContent) const
+    {
+        return evaluateFunction(waterContent, waterContent);
+    }
+
+    VaporPermeability::VaporPermeability(const double t_resistanceFactor) :
+        IFunction(Variable::temperature),
+        m_ResistanceFactor(t_resistanceFactor)
+    {}
+
+    VaporPermeability::VaporPermeability(
+      const std::vector<FenestrationCommon::point> & t_resistanceFactorCurve,
+      const IMaterial & t_material) :
+        IFunction(Variable::temperature),
+        m_ResistanceFactorCurve(t_resistanceFactorCurve),
+        m_Material(&t_material)
+    {}
+
+    double VaporPermeability::resistanceFactorAt(const INode2D & node) const
+    {
+        if(!m_ResistanceFactorCurve.has_value())
+        {
+            return m_ResistanceFactor;
+        }
+
+        // Resolve w through the bound material rather than through the node's averaged
+        // Variable::water: at a material interface the averaged content is not consistent
+        // with this material's own curve, which would make the coefficient non-uniform
+        // across an element. Same reasoning as LiquidTransportationCurve::value.
+        return m_ResistanceFactorCurve->at(
+          m_Material->waterContent(node).content(WaterContent::Water));
+    }
+
+    double VaporPermeability::value(const INode2D & node) const
+    {
+        return vaporDiffusionCoefficientAtTemperature(node.property(Variable::temperature))
+               / resistanceFactorAt(node);
+    }
+
+    double VaporPermeability::evaluateFunction(const double t_position, const double) const
+    {
+        return vaporDiffusionCoefficientAtTemperature(t_position) / m_ResistanceFactor;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  Heat of evaporation
+    //////////////////////////////////////////////////////////////////
+
+    double HeatOfEvaporation::evaluateFunction(const double t_position, const double) const
+    {
+        return heatOfEvaporation(t_position);
+    }
+
+    HeatOfEvaporation::HeatOfEvaporation() : IFunction(Variable::temperature)
+    {}
+
+    //////////////////////////////////////////////////////////////////
+    ///  Phase change
+    //////////////////////////////////////////////////////////////////
+    PhaseChange::PhaseChange() : IFunction(Variable::temperature)
+    {}
+
+    double PhaseChange::value(const INode2D & node) const
+    {
+        return valueWithPreviousTimestep(node);
+    }
+
+    double PhaseChange::evaluateFunction(const double t_position,
+                                         const double t_PreviousTimestep) const
+    {
+        using Constants::FreezingPoint;
+        using Constants::IcePoint;
+        using Constants::EnthalpyOfFusion;
+
+        auto result = 0.0;
+
+
+        if(t_PreviousTimestep < IcePoint)
+        {
+            // Entire content of ice has melted.
+            if(t_position >= FreezingPoint)
+            {
+                result = EnthalpyOfFusion;
+            }
+
+            // Only part of ice has melted and therefore linear interpolation is needed.
+            if((t_position < FreezingPoint) && (t_position >= IcePoint))
+            {
+                result = EnthalpyOfFusion * (t_position - IcePoint) / (FreezingPoint - IcePoint);
+            }
+        }
+
+        if(t_PreviousTimestep >= FreezingPoint)
+        {
+            // Entire content of water has froze.
+            if(t_position < IcePoint)
+            {
+                result = -Constants::EnthalpyOfFusion;
+            }
+
+            // Only part of water froze and therefore linear interpolation is needed.
+            if((t_position < FreezingPoint) && (t_position >= IcePoint))
+            {
+                result =
+                  EnthalpyOfFusion * (t_position - FreezingPoint) / (FreezingPoint - IcePoint);
+            }
+        }
+
+        return result;
+    }
+
+    //////////////////////////////////////////////////////////////////
+    ///  FusionSecantCapacity
+    //////////////////////////////////////////////////////////////////
+
+    double liquidFractionFromTemperature(const double temperature)
+    {
+        using Constants::FreezingPoint;
+        using Constants::IcePoint;
+
+        const double span = FreezingPoint - IcePoint;
+        return std::clamp((temperature - IcePoint) / span, 0.0, 1.0);
+    }
+
+    FusionSecantCapacity::FusionSecantCapacity() : IFunction(Variable::temperature)
+    {}
+
+    double FusionSecantCapacity::value(const INode2D & node) const
+    {
+        return valueWithPreviousTimestep(node);
+    }
+
+    double FusionSecantCapacity::evaluateFunction(const double t_position,
+                                                  const double t_previousTimestep) const
+    {
+        using Constants::EnthalpyOfFusion;
+        using Constants::FreezingPoint;
+        using Constants::IcePoint;
+
+        const double dTemp = t_position - t_previousTimestep;
+        constexpr double minDelta = 1e-12;
+        if(std::abs(dTemp) > minDelta)
+        {
+            // Secant over the step -> energy-conservative fusion capacity.
+            return EnthalpyOfFusion
+                   * (liquidFractionFromTemperature(t_position)
+                      - liquidFractionFromTemperature(t_previousTimestep))
+                   / dTemp;
+        }
+
+        // Secant undefined (no change since previous timestep): tangent, nonzero only
+        // inside the freezing ramp.
+        const bool insideRamp = (t_position > IcePoint) && (t_position < FreezingPoint);
+        return insideRamp ? EnthalpyOfFusion / (FreezingPoint - IcePoint) : 0.0;
+    }
+}   // namespace HygroThermFEM
